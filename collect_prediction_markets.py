@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -15,10 +15,10 @@ from collector_common import (
     save_raw_json,
 )
 
-
 OUTPUT_PATH = "processed/prediction_markets.csv"
 
-EXPECTED_COLUMNS = [
+# Shared schema core block (Section 4 of spec), followed by platform-specific extras.
+CORE_COLUMNS = [
     "platform",
     "platform_type",
     "metric_date",
@@ -27,6 +27,12 @@ EXPECTED_COLUMNS = [
     "volume_basis",
     "revenue",
     "liquidity_or_oi",
+    "source_url",
+    "collected_at_utc",
+    "collector_version",
+]
+
+EXTRA_COLUMNS = [
     "market_id",
     "market_title",
     "category",
@@ -37,11 +43,13 @@ EXPECTED_COLUMNS = [
     "open_interest",
     "status",
     "resolution",
-    "source_url",
-    "collected_at_utc",
-    "collector_version",
+    # True where value is explicitly API-surfaced as on-chain-derived market data
+    # (Polymarket Gamma/Data APIs index blockchain state).
     "volume_is_onchain_derived",
 ]
+
+EXPECTED_COLUMNS = CORE_COLUMNS + EXTRA_COLUMNS
+PROVENANCE_COLUMNS = ["source_url", "collected_at_utc", "collector_version"]
 
 
 def first_of(mapping: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
@@ -147,28 +155,47 @@ def normalize_kalshi_market(market: Dict[str, Any], source_url: str) -> Dict[str
 def fetch_kalshi_markets(client: PoliteClient, cfg: Dict[str, Any], logger) -> List[Dict[str, Any]]:
     base = cfg["base_url"].rstrip("/")
     endpoint = cfg["markets_endpoint"]
-    params = dict(cfg.get("default_params", {}))
-    cursor: Optional[str] = None
-    page_num = 1
+    base_params = dict(cfg.get("default_params", {}))
+    statuses = ["unopened", "open", "paused", "closed", "settled"]
+
     rows: List[Dict[str, Any]] = []
+    seen_market_ids: Set[str] = set()
 
-    while True:
-        page_params = dict(params)
-        if cursor:
-            page_params["cursor"] = cursor
-        response = client.get(url=f"{base}{endpoint}", params=page_params, use_cache=True, robots_required=False)
-        payload = json.loads(response.body.decode("utf-8"))
-        save_raw_json(source=f"kalshi_markets_p{page_num}", payload=payload)
+    for status in statuses:
+        cursor: Optional[str] = None
+        page_num = 1
+        while True:
+            params = dict(base_params)
+            params["status"] = status
+            if cursor:
+                params["cursor"] = cursor
 
-        markets = payload.get("markets", []) if isinstance(payload, dict) else []
-        logger.info("kalshi page=%s rows=%s url=%s", page_num, len(markets), response.url)
-        for market in markets:
-            rows.append(normalize_kalshi_market(market, source_url=response.url))
+            response = client.get(url=f"{base}{endpoint}", params=params, use_cache=True, robots_required=False)
+            payload = json.loads(response.body.decode("utf-8"))
+            save_raw_json(source=f"kalshi_markets_{status}_p{page_num}", payload=payload)
 
-        cursor = payload.get("cursor")
-        page_num += 1
-        if not cursor:
-            break
+            markets = payload.get("markets", []) if isinstance(payload, dict) else []
+            logger.info(
+                "kalshi status=%s page=%s rows=%s url=%s http=%s",
+                status,
+                page_num,
+                len(markets),
+                response.url,
+                response.status_code,
+            )
+            for market in markets:
+                market_id = str(first_of(market, ["ticker", "id"], ""))
+                if not market_id:
+                    continue
+                if market_id in seen_market_ids:
+                    continue
+                seen_market_ids.add(market_id)
+                rows.append(normalize_kalshi_market(market, source_url=response.url))
+
+            cursor = payload.get("cursor") if isinstance(payload, dict) else None
+            page_num += 1
+            if not cursor:
+                break
 
     return rows
 
@@ -207,7 +234,7 @@ def fetch_polymarket_open_interest(
         try:
             payload = json.loads(response.body.decode("utf-8"))
         except Exception:
-            logger.warning("Failed to decode Polymarket OI response for chunk starting at %s", idx)
+            logger.warning("Failed to decode Polymarket OI response for chunk start=%s", idx)
             continue
         save_raw_json(source=f"polymarket_oi_{idx}", payload=payload)
         if isinstance(payload, list):
@@ -216,6 +243,14 @@ def fetch_polymarket_open_interest(
                 value = to_float(item.get("value"))
                 if market and value is not None:
                     out[market] = value
+        logger.info(
+            "polymarket_oi chunk_start=%s chunk_size=%s rows=%s url=%s http=%s",
+            idx,
+            len(chunk),
+            len(payload) if isinstance(payload, list) else 0,
+            response.url,
+            response.status_code,
+        )
     return out
 
 
@@ -243,7 +278,6 @@ def normalize_polymarket_market(
 
     liquidity = to_float(first_of(market, ["liquidityNum", "liquidity"]))
     liquidity_or_oi = open_interest if open_interest is not None else liquidity
-
     volume = volume_24h if volume_24h is not None else volume_total
     volume_basis = "24h" if volume_24h is not None else ("total" if volume_total is not None else "unknown")
 
@@ -271,57 +305,99 @@ def normalize_polymarket_market(
     return add_provenance(row, source_url=source_url)
 
 
-def fetch_polymarket_markets(client: PoliteClient, cfg: Dict[str, Any], logger) -> List[Dict[str, Any]]:
-    gamma_base = cfg["gamma_base_url"].rstrip("/")
-    endpoint = cfg["markets_endpoint"]
-    params = dict(cfg.get("default_params", {}))
+def _fetch_polymarket_scenario(
+    client: PoliteClient,
+    gamma_base: str,
+    endpoint: str,
+    base_params: Dict[str, Any],
+    scenario_name: str,
+    scenario_params: Dict[str, Any],
+    logger,
+) -> List[Dict[str, Any]]:
     cursor: Optional[str] = None
     page_num = 1
-    collected: List[Dict[str, Any]] = []
-    condition_ids: List[str] = []
+    items_out: List[Dict[str, Any]] = []
 
     while True:
-        page_params = dict(params)
+        params = dict(base_params)
+        params.update(scenario_params)
         if cursor:
-            page_params["after_cursor"] = cursor
-        response = client.get(url=f"{gamma_base}{endpoint}", params=page_params, use_cache=True, robots_required=False)
+            params["after_cursor"] = cursor
+        response = client.get(url=f"{gamma_base}{endpoint}", params=params, use_cache=True, robots_required=False)
         payload = json.loads(response.body.decode("utf-8"))
-        save_raw_json(source=f"polymarket_markets_p{page_num}", payload=payload)
-
+        save_raw_json(source=f"polymarket_markets_{scenario_name}_p{page_num}", payload=payload)
         items, next_cursor = _extract_polymarket_items(payload)
-        logger.info("polymarket page=%s rows=%s url=%s", page_num, len(items), response.url)
-        collected.extend(items)
-        for item in items:
-            cid = first_of(item, ["conditionId", "condition_id"])
-            if cid:
-                condition_ids.append(cid)
-
+        logger.info(
+            "polymarket scenario=%s page=%s rows=%s url=%s http=%s",
+            scenario_name,
+            page_num,
+            len(items),
+            response.url,
+            response.status_code,
+        )
+        items_out.extend(items)
         page_num += 1
         cursor = next_cursor
         if not cursor:
             break
 
+    return items_out
+
+
+def fetch_polymarket_markets(client: PoliteClient, cfg: Dict[str, Any], logger) -> List[Dict[str, Any]]:
+    gamma_base = cfg["gamma_base_url"].rstrip("/")
+    endpoint = cfg["markets_endpoint"]
+    base_params = dict(cfg.get("default_params", {}))
+
+    # Gamma commonly defaults to open/active markets; gather both open and closed
+    # snapshots to satisfy “every available market” in the spec.
+    scenarios = [
+        ("open", {"closed": False}),
+        ("closed", {"closed": True}),
+    ]
+
+    collected: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    condition_ids: Set[str] = set()
+
+    for scenario_name, scenario_params in scenarios:
+        items = _fetch_polymarket_scenario(
+            client=client,
+            gamma_base=gamma_base,
+            endpoint=endpoint,
+            base_params=base_params,
+            scenario_name=scenario_name,
+            scenario_params=scenario_params,
+            logger=logger,
+        )
+        for item in items:
+            market_id = str(first_of(item, ["id", "conditionId", "slug"], ""))
+            if not market_id:
+                continue
+            if market_id in seen_ids:
+                continue
+            seen_ids.add(market_id)
+            collected.append(item)
+            cid = first_of(item, ["conditionId", "condition_id"])
+            if cid:
+                condition_ids.add(str(cid))
+
     oi_lookup = fetch_polymarket_open_interest(
         client=client,
         data_api_base=cfg["data_base_url"],
-        condition_ids=sorted(set(condition_ids)),
+        condition_ids=sorted(condition_ids),
         logger=logger,
     )
-
-    rows = [normalize_polymarket_market(item, source_url=f"{gamma_base}{endpoint}", oi_lookup=oi_lookup) for item in collected]
-    return rows
+    return [normalize_polymarket_market(item, source_url=f"{gamma_base}{endpoint}", oi_lookup=oi_lookup) for item in collected]
 
 
 def assert_valid_prediction_schema(df: pd.DataFrame) -> None:
     missing = [col for col in EXPECTED_COLUMNS if col not in df.columns]
     if missing:
         raise AssertionError(f"Missing columns: {missing}")
-    if df["source_url"].isna().any() or (df["source_url"].astype(str).str.strip() == "").any():
-        raise AssertionError("source_url must be non-null and non-empty")
-    if df["collected_at_utc"].isna().any() or (df["collected_at_utc"].astype(str).str.strip() == "").any():
-        raise AssertionError("collected_at_utc must be non-null and non-empty")
-    if df["collector_version"].isna().any() or (df["collector_version"].astype(str).str.strip() == "").any():
-        raise AssertionError("collector_version must be non-null and non-empty")
+    for col in PROVENANCE_COLUMNS:
+        if df[col].isna().any() or (df[col].astype(str).str.strip() == "").any():
+            raise AssertionError(f"{col} must be non-null and non-empty")
 
 
 def build_prediction_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -347,7 +423,13 @@ def main() -> None:
 
     df = build_prediction_dataframe(rows)
     df.to_csv(OUTPUT_PATH, index=False)
-    logger.info("Wrote %s rows to %s", len(df), OUTPUT_PATH)
+    logger.info(
+        "Wrote rows=%s output=%s kalshi_rows=%s polymarket_rows=%s",
+        len(df),
+        OUTPUT_PATH,
+        len(kalshi_rows),
+        len(polymarket_rows),
+    )
 
 
 if __name__ == "__main__":

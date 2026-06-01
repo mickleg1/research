@@ -1,11 +1,20 @@
 import pandas as pd
 
-from collect_prediction_markets import EXPECTED_COLUMNS, assert_valid_prediction_schema, build_prediction_dataframe
+from collect_prediction_markets import (
+    CORE_COLUMNS,
+    EXPECTED_COLUMNS,
+    assert_valid_prediction_schema,
+    build_prediction_dataframe,
+)
 
 
 def test_expected_columns_present() -> None:
     for col in ["source_url", "collected_at_utc", "collector_version"]:
         assert col in EXPECTED_COLUMNS
+
+
+def test_core_columns_lead_schema() -> None:
+    assert EXPECTED_COLUMNS[: len(CORE_COLUMNS)] == CORE_COLUMNS
 
 
 def test_schema_validation_rejects_missing_provenance() -> None:

@@ -1,79 +1,73 @@
-contact_email: "research@example.edu"
-user_agent: "sportsbook-prediction-market-collector/1.0 (contact: research@example.edu)"
+contact_email: research@example.edu
+user_agent: 'sportsbook-prediction-market-collector/1.0 (contact: research@example.edu)'
 request_rate_limit_per_sec: 1.0
 request_timeout_sec: 30
-
 prediction_markets:
   kalshi:
-    base_url: "https://external-api.kalshi.com/trade-api/v2"
-    markets_endpoint: "/markets"
+    base_url: https://external-api.kalshi.com/trade-api/v2
+    markets_endpoint: /markets
     default_params:
       limit: 500
-      status: "open"
   polymarket:
-    gamma_base_url: "https://gamma-api.polymarket.com"
-    data_base_url: "https://data-api.polymarket.com"
-    markets_endpoint: "/markets/keyset"
+    gamma_base_url: https://gamma-api.polymarket.com
+    data_base_url: https://data-api.polymarket.com
+    markets_endpoint: /markets/keyset
     default_params:
       limit: 100
-      active: true
-      closed: false
-
 sportsbook_records:
   states:
     NJ:
-      regulator: "New Jersey Division of Gaming Enforcement"
+      regulator: New Jersey Division of Gaming Enforcement
       report_index_urls:
-        - "https://www.nj.gov/oag/ge/financials.html"
+      - https://www.nj.gov/oag/ge/financials.html
       operator_aliases:
-        "DraftKings": "draftkings"
-        "DraftKings Sportsbook": "draftkings"
-        "DK": "draftkings"
-        "FanDuel": "fanduel"
-        "FanDuel Sportsbook": "fanduel"
-        "BetMGM": "betmgm"
-        "Bet MGM": "betmgm"
+        DraftKings: draftkings
+        DraftKings Sportsbook: draftkings
+        DK: draftkings
+        FanDuel: fanduel
+        FanDuel Sportsbook: fanduel
+        BetMGM: betmgm
+        Bet MGM: betmgm
     PA:
-      regulator: "Pennsylvania Gaming Control Board"
+      regulator: Pennsylvania Gaming Control Board
       report_index_urls:
-        - "https://gamingcontrolboard.pa.gov/?p=financial-reports"
+      - https://gamingcontrolboard.pa.gov/?p=financial-reports
       operator_aliases:
-        "DraftKings": "draftkings"
-        "FanDuel": "fanduel"
-        "BetMGM": "betmgm"
+        DraftKings: draftkings
+        FanDuel: fanduel
+        BetMGM: betmgm
     NY:
-      regulator: "New York State Gaming Commission"
+      regulator: New York State Gaming Commission
       report_index_urls:
-        - "https://gaming.ny.gov/gaming/sportswagering.php"
+      - https://gaming.ny.gov/gaming/sportswagering.php
       operator_aliases:
-        "DraftKings": "draftkings"
-        "FanDuel": "fanduel"
-        "BetMGM": "betmgm"
-
+        DraftKings: draftkings
+        FanDuel: fanduel
+        BetMGM: betmgm
 ux_features:
   platforms:
-    - draftkings
-    - fanduel
-    - kalshi
-    - polymarket
+  - draftkings
+  - fanduel
+  - kalshi
+  - polymarket
   source_pages:
     draftkings:
-      - "https://sportsbook.draftkings.com/"
-      - "https://www.draftkings.com/sportsbook"
-      - "https://apps.apple.com/us/app/draftkings-sportsbook-casino/id1131399201"
-      - "https://play.google.com/store/apps/details?id=com.draftkings.sportsbook"
+    - https://sportsbook.draftkings.com/
+    - https://www.draftkings.com/sportsbook
+    - https://apps.apple.com/us/app/draftkings-sportsbook-casino/id1131399201
+    - https://play.google.com/store/apps/details?id=com.draftkings.sportsbook
     fanduel:
-      - "https://sportsbook.fanduel.com/"
-      - "https://www.fanduel.com/sportsbook"
-      - "https://apps.apple.com/us/app/fanduel-sportsbook-casino/id1275517595"
-      - "https://play.google.com/store/apps/details?id=com.fanduel.sportsbook"
+    - https://sportsbook.fanduel.com/
+    - https://www.fanduel.com/sportsbook
+    - https://apps.apple.com/us/app/fanduel-sportsbook-casino/id1275517595
+    - https://play.google.com/store/apps/details?id=com.fanduel.sportsbook
     kalshi:
-      - "https://kalshi.com/"
-      - "https://kalshi.com/markets"
-      - "https://apps.apple.com/us/app/kalshi/id1641176216"
-      - "https://play.google.com/store/apps/details?id=com.kalshi.app"
+    - https://kalshi.com/
+    - https://kalshi.com/markets
+    - https://apps.apple.com/us/app/kalshi/id1641176216
+    - https://play.google.com/store/apps/details?id=com.kalshi.app
     polymarket:
-      - "https://polymarket.com/"
-      - "https://polymarket.com/markets"
-      - "https://apps.apple.com/us/app/polymarket/id6475594735"
-      - "https://play.google.com/store/apps/details?id=com.polymarket.app"
+    - https://polymarket.com/
+    - https://polymarket.com/markets
+    - https://apps.apple.com/us/app/polymarket/id6475594735
+    - https://play.google.com/store/apps/details?id=com.polymarket.app
