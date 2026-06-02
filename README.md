@@ -79,6 +79,19 @@ Output:
 
 - `/processed/metrics_combined.csv`
 
+### 5) Analysis exhibits (Module D)
+
+```bash
+python3 analyze.py
+```
+
+Output:
+
+- `/outputs/figures/*.png` and `/outputs/figures/*.svg`
+- `/outputs/tables/*.tex` and `/outputs/tables/*.xlsx`
+- `/outputs/captions.md`
+- validation trace logs in `/logs/analyze_*.log`
+
 ## Tests
 
 ```bash
