@@ -14,6 +14,29 @@ prediction_markets:
     markets_endpoint: /markets/keyset
     default_params:
       limit: 100
+  snapshot_lookback_days: 90
+  max_pages: 25
+  series_start: '2024-01-01'
+  series_end: '2026-12-31'
+  category_group_map:
+    sports: sports_event
+    sport: sports_event
+    sports_event: sports_event
+    nfl: sports_event
+    nba: sports_event
+    mlb: sports_event
+    nhl: sports_event
+    soccer: sports_event
+    tennis: sports_event
+    golf: sports_event
+    mma: sports_event
+    boxing: sports_event
+    esports: sports_event
+    politics: other
+    economics: other
+    crypto: other
+    weather: other
+    other: other
 sportsbook_records:
   states:
     NJ:

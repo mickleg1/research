@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import json
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -15,41 +16,43 @@ from collector_common import (
     save_raw_json,
 )
 
-OUTPUT_PATH = "processed/prediction_markets.csv"
+SNAPSHOT_OUTPUT_PATH = "processed/pm_snapshot.csv"
+MONTHLY_OUTPUT_PATH = "processed/pm_monthly.csv"
 
-# Shared schema core block (Section 4 of spec), followed by platform-specific extras.
-CORE_COLUMNS = [
+PROVENANCE_COLUMNS = ["source_url", "collected_at_utc", "collector_version"]
+
+SNAPSHOT_COLUMNS = [
     "platform",
     "platform_type",
-    "metric_date",
-    "geography",
-    "volume",
-    "volume_basis",
-    "revenue",
+    "market_id",
+    "title",
+    "category",
+    "category_group",
+    "implied_probability",
+    "raw_price",
+    "volume_24h",
+    "volume_total",
     "liquidity_or_oi",
+    "status",
     "source_url",
     "collected_at_utc",
     "collector_version",
 ]
 
-EXTRA_COLUMNS = [
-    "market_id",
-    "market_title",
-    "category",
-    "implied_probability",
-    "raw_price",
+MONTHLY_COLUMNS = [
+    "platform",
+    "platform_type",
+    "month_end",
+    "category_group",
+    "market_count",
     "volume_24h",
     "volume_total",
-    "open_interest",
-    "status",
-    "resolution",
-    # True where value is explicitly API-surfaced as on-chain-derived market data
-    # (Polymarket Gamma/Data APIs index blockchain state).
-    "volume_is_onchain_derived",
+    "liquidity_or_oi",
+    "volume_basis",
+    "source_url",
+    "collected_at_utc",
+    "collector_version",
 ]
-
-EXPECTED_COLUMNS = CORE_COLUMNS + EXTRA_COLUMNS
-PROVENANCE_COLUMNS = ["source_url", "collected_at_utc", "collector_version"]
 
 
 def first_of(mapping: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
@@ -65,13 +68,64 @@ def to_float(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
+
+
+def parse_market_timestamp(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    if isinstance(value, (int, float)):
+        unit = "ms" if value > 10_000_000_000 else "s"
+        parsed = pd.to_datetime(value, unit=unit, errors="coerce", utc=True)
+        if pd.isna(parsed):
+            return None
+        return parsed.to_pydatetime()
+    if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
             return None
-        try:
-            return float(stripped)
-        except ValueError:
+        if stripped.isdigit():
+            as_num = float(stripped)
+            unit = "ms" if as_num > 10_000_000_000 else "s"
+            parsed = pd.to_datetime(as_num, unit=unit, errors="coerce", utc=True)
+            if pd.isna(parsed):
+                return None
+            return parsed.to_pydatetime()
+        parsed = pd.to_datetime(stripped, errors="coerce", utc=True)
+        if pd.isna(parsed):
             return None
+        return parsed.to_pydatetime()
+    return None
+
+
+def extract_market_datetime(market: Dict[str, Any]) -> Optional[datetime]:
+    for key in [
+        "close_time",
+        "expiration_time",
+        "settlement_time",
+        "settled_time",
+        "resolved_time",
+        "endDate",
+        "end_date",
+        "endDateIso",
+        "closedTime",
+        "resolveTime",
+        "event_start_time",
+        "event_date",
+        "created_at",
+    ]:
+        parsed = parse_market_timestamp(market.get(key))
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -80,91 +134,178 @@ def parse_outcome_prices(value: Any) -> Optional[List[float]]:
         return None
     if isinstance(value, list):
         out = [to_float(v) for v in value]
-        return [v for v in out if v is not None] or None
+        vals = [v for v in out if v is not None]
+        return vals or None
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
-            if isinstance(parsed, list):
-                out = [to_float(v) for v in parsed]
-                return [v for v in out if v is not None] or None
         except json.JSONDecodeError:
             return None
+        if isinstance(parsed, list):
+            out = [to_float(v) for v in parsed]
+            vals = [v for v in out if v is not None]
+            return vals or None
     return None
 
 
-def normalize_probability(raw_price: Optional[float], explicit_prob: Optional[float]) -> Optional[float]:
-    if explicit_prob is not None:
-        if explicit_prob > 1:
-            return explicit_prob / 100.0
-        return explicit_prob
+def normalize_probability(raw_price: Optional[float], explicit_probability: Optional[float]) -> Optional[float]:
+    if explicit_probability is not None:
+        return explicit_probability / 100.0 if explicit_probability > 1 else explicit_probability
     if raw_price is None:
         return None
-    if raw_price > 1:
-        return raw_price / 100.0
-    return raw_price
+    return raw_price / 100.0 if raw_price > 1 else raw_price
 
 
-def normalize_kalshi_market(market: Dict[str, Any], source_url: str) -> Dict[str, Any]:
-    raw_price = to_float(
-        first_of(
-            market,
-            [
-                "yes_price",
-                "yes_bid",
-                "yes_ask",
-                "last_price",
-                "last_trade_price",
-            ],
+def canonical_key(text: str) -> str:
+    return "".join(ch.lower() for ch in text if ch.isalnum())
+
+
+def resolve_category(platform: str, market: Dict[str, Any]) -> str:
+    if platform == "kalshi":
+        raw = first_of(market, ["category", "series_ticker", "event_ticker", "subtitle"], "unknown")
+        return str(raw)
+
+    raw = first_of(market, ["category", "series", "tag", "slug", "question"], "unknown")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                return item
+            if isinstance(item, dict):
+                label = first_of(item, ["label", "name", "slug"])
+                if label:
+                    return str(label)
+    return str(raw)
+
+
+def resolve_category_group(category: str, category_group_map: Dict[str, str]) -> str:
+    key = canonical_key(category)
+    if key in category_group_map:
+        return category_group_map[key]
+    return "other"
+
+
+def check_page_cap(page_num: int, max_pages: int, context: str) -> None:
+    if page_num > max_pages:
+        raise RuntimeError(
+            f"Pagination exceeded max_pages={max_pages} in {context}. "
+            "Aborting to prevent unbounded collection."
         )
-    )
-    implied = normalize_probability(
-        raw_price=raw_price,
-        explicit_prob=to_float(first_of(market, ["implied_probability"])),
-    )
-    volume_24h = to_float(first_of(market, ["volume_24h", "volume24h"]))
-    volume_total = to_float(first_of(market, ["volume", "total_volume", "volume_total"]))
-    open_interest = to_float(first_of(market, ["open_interest", "liquidity"]))
 
-    volume = volume_24h if volume_24h is not None else volume_total
-    volume_basis = "24h" if volume_24h is not None else ("total" if volume_total is not None else "unknown")
 
+def _extract_kalshi_page(payload: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not isinstance(payload, dict):
+        return [], None
+    markets = payload.get("markets")
+    if not isinstance(markets, list):
+        return [], None
+    cursor = payload.get("cursor")
+    return markets, str(cursor) if cursor else None
+
+
+def _extract_polymarket_page(payload: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if isinstance(payload, list):
+        return payload, None
+    if isinstance(payload, dict):
+        if isinstance(payload.get("markets"), list):
+            next_cursor = payload.get("next_cursor")
+            return payload["markets"], str(next_cursor) if next_cursor else None
+        if isinstance(payload.get("data"), list):
+            next_cursor = payload.get("next_cursor")
+            return payload["data"], str(next_cursor) if next_cursor else None
+    return [], None
+
+
+def should_stop_settled_pagination(markets: Sequence[Dict[str, Any]], lower_bound: datetime) -> bool:
+    timestamps = [extract_market_datetime(market) for market in markets]
+    timestamps = [ts for ts in timestamps if ts is not None]
+    if not timestamps:
+        return False
+    oldest = min(timestamps)
+    return oldest < lower_bound
+
+
+def normalize_snapshot_row(
+    platform: str,
+    market: Dict[str, Any],
+    source_url: str,
+    category_group_map: Dict[str, str],
+    status_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    if platform == "kalshi":
+        raw_price = to_float(first_of(market, ["yes_price", "yes_bid", "yes_ask", "last_price", "last_trade_price"]))
+        implied = normalize_probability(raw_price, to_float(first_of(market, ["implied_probability"])))
+        volume_24h = to_float(first_of(market, ["volume_24h", "volume24h"]))
+        volume_total = to_float(first_of(market, ["volume", "total_volume", "volume_total"]))
+        liquidity_or_oi = to_float(first_of(market, ["open_interest", "liquidity"]))
+        status = status_override or str(first_of(market, ["status"], "unknown"))
+        market_id = str(first_of(market, ["ticker", "id"], ""))
+        title = str(first_of(market, ["title", "subtitle"], ""))
+    else:
+        outcome_prices = parse_outcome_prices(first_of(market, ["outcomePrices", "outcome_prices"]))
+        raw_price = to_float(first_of(market, ["lastTradePrice", "last_price"]))
+        if raw_price is None and outcome_prices:
+            raw_price = outcome_prices[0]
+        implied = normalize_probability(raw_price, to_float(first_of(market, ["probability", "implied_probability"])))
+        volume_24h = to_float(first_of(market, ["volume24hr", "volume_24h", "volume24h"]))
+        volume_total = to_float(first_of(market, ["volumeNum", "volume", "volume_total"]))
+        liquidity_or_oi = to_float(first_of(market, ["openInterest", "open_interest", "liquidityNum", "liquidity"]))
+        status = status_override or ("closed" if bool(first_of(market, ["closed"], False)) else "open")
+        market_id = str(first_of(market, ["id", "conditionId", "slug"], ""))
+        title = str(first_of(market, ["question", "title"], ""))
+
+    category = resolve_category(platform, market)
     row = {
-        "platform": "kalshi",
+        "platform": platform,
         "platform_type": "prediction_market",
-        "metric_date": datetime.now(timezone.utc).date().isoformat(),
-        "geography": "US",
-        "volume": volume,
-        "volume_basis": volume_basis,
-        "revenue": None,
-        "liquidity_or_oi": open_interest,
-        "market_id": first_of(market, ["ticker", "id"]),
-        "market_title": first_of(market, ["title", "subtitle"]),
-        "category": first_of(market, ["category", "series_ticker", "event_ticker"]),
+        "market_id": market_id,
+        "title": title,
+        "category": category,
+        "category_group": resolve_category_group(category, category_group_map),
         "implied_probability": implied,
         "raw_price": raw_price,
         "volume_24h": volume_24h,
         "volume_total": volume_total,
-        "open_interest": open_interest,
-        "status": first_of(market, ["status"]),
-        "resolution": first_of(market, ["result", "settlement_result", "resolution"]),
-        "volume_is_onchain_derived": False,
+        "liquidity_or_oi": liquidity_or_oi,
+        "status": str(status),
     }
     return add_provenance(row, source_url=source_url)
 
 
-def fetch_kalshi_markets(client: PoliteClient, cfg: Dict[str, Any], logger) -> List[Dict[str, Any]]:
+def _filter_window(ts: Optional[datetime], start_dt: Optional[datetime], end_dt: Optional[datetime]) -> bool:
+    if ts is None:
+        return False
+    if start_dt and ts < start_dt:
+        return False
+    if end_dt and ts > end_dt:
+        return False
+    return True
+
+
+def fetch_kalshi_rows(
+    client: PoliteClient,
+    cfg: Dict[str, Any],
+    logger,
+    *,
+    mode: str,
+    max_pages: int,
+    category_group_map: Dict[str, str],
+    settled_start: Optional[datetime],
+    settled_end: Optional[datetime],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     base = cfg["base_url"].rstrip("/")
     endpoint = cfg["markets_endpoint"]
     base_params = dict(cfg.get("default_params", {}))
-    statuses = ["unopened", "open", "paused", "closed", "settled"]
+    statuses = ["open", "settled"]
 
     rows: List[Dict[str, Any]] = []
-    seen_market_ids: Set[str] = set()
+    page_total = 0
+    market_total = 0
 
     for status in statuses:
         cursor: Optional[str] = None
         page_num = 1
         while True:
+            check_page_cap(page_num, max_pages, f"kalshi:{status}:{mode}")
             params = dict(base_params)
             params["status"] = status
             if cursor:
@@ -172,264 +313,343 @@ def fetch_kalshi_markets(client: PoliteClient, cfg: Dict[str, Any], logger) -> L
 
             response = client.get(url=f"{base}{endpoint}", params=params, use_cache=True, robots_required=False)
             payload = json.loads(response.body.decode("utf-8"))
-            save_raw_json(source=f"kalshi_markets_{status}_p{page_num}", payload=payload)
+            save_raw_json(source=f"kalshi_{mode}_{status}_p{page_num}", payload=payload)
 
-            markets = payload.get("markets", []) if isinstance(payload, dict) else []
+            markets, next_cursor = _extract_kalshi_page(payload)
+            page_total += 1
+            market_total += len(markets)
             logger.info(
-                "kalshi status=%s page=%s rows=%s url=%s http=%s",
+                "kalshi mode=%s status=%s page=%s rows=%s url=%s http=%s",
+                mode,
                 status,
                 page_num,
                 len(markets),
                 response.url,
                 response.status_code,
             )
-            for market in markets:
-                market_id = str(first_of(market, ["ticker", "id"], ""))
-                if not market_id:
-                    continue
-                if market_id in seen_market_ids:
-                    continue
-                seen_market_ids.add(market_id)
-                rows.append(normalize_kalshi_market(market, source_url=response.url))
 
-            cursor = payload.get("cursor") if isinstance(payload, dict) else None
-            page_num += 1
-            if not cursor:
+            for market in markets:
+                market_ts = extract_market_datetime(market)
+                if status == "settled" and not _filter_window(market_ts, settled_start, settled_end):
+                    continue
+                row = normalize_snapshot_row(
+                    platform="kalshi",
+                    market=market,
+                    source_url=response.url,
+                    category_group_map=category_group_map,
+                    status_override=status,
+                )
+                row["__market_ts"] = market_ts
+                rows.append(row)
+
+            if status == "open":
+                # Snapshot mode is intentionally single-pass for current opens.
+                if next_cursor:
+                    logger.info("kalshi mode=%s status=open single-pass stop after page=%s", mode, page_num)
                 break
 
-    return rows
+            if status == "settled" and settled_start and should_stop_settled_pagination(markets, settled_start):
+                logger.info(
+                    "kalshi mode=%s status=settled stop_at_window page=%s lower_bound=%s",
+                    mode,
+                    page_num,
+                    settled_start.isoformat(),
+                )
+                break
+
+            if not next_cursor:
+                break
+
+            cursor = next_cursor
+            page_num += 1
+
+    logger.info("kalshi mode=%s pages=%s markets_seen=%s rows_kept=%s", mode, page_total, market_total, len(rows))
+    return rows, {"pages": page_total, "markets_seen": market_total, "rows_kept": len(rows)}
 
 
-def _extract_polymarket_items(payload: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if isinstance(payload, list):
-        return payload, None
-    if isinstance(payload, dict):
-        if isinstance(payload.get("markets"), list):
-            return payload.get("markets", []), payload.get("next_cursor")
-        if isinstance(payload.get("data"), list):
-            return payload.get("data", []), payload.get("next_cursor")
-    return [], None
-
-
-def fetch_polymarket_open_interest(
+def fetch_polymarket_rows(
     client: PoliteClient,
-    data_api_base: str,
-    condition_ids: List[str],
+    cfg: Dict[str, Any],
     logger,
-) -> Dict[str, float]:
-    if not condition_ids:
-        return {}
-
-    out: Dict[str, float] = {}
-    batch_size = 100
-    for idx in range(0, len(condition_ids), batch_size):
-        chunk = condition_ids[idx : idx + batch_size]
-        params = {"market": ",".join(chunk)}
-        response = client.get(
-            url=f"{data_api_base.rstrip('/')}/oi",
-            params=params,
-            use_cache=True,
-            robots_required=False,
-        )
-        try:
-            payload = json.loads(response.body.decode("utf-8"))
-        except Exception:
-            logger.warning("Failed to decode Polymarket OI response for chunk start=%s", idx)
-            continue
-        save_raw_json(source=f"polymarket_oi_{idx}", payload=payload)
-        if isinstance(payload, list):
-            for item in payload:
-                market = item.get("market")
-                value = to_float(item.get("value"))
-                if market and value is not None:
-                    out[market] = value
-        logger.info(
-            "polymarket_oi chunk_start=%s chunk_size=%s rows=%s url=%s http=%s",
-            idx,
-            len(chunk),
-            len(payload) if isinstance(payload, list) else 0,
-            response.url,
-            response.status_code,
-        )
-    return out
-
-
-def normalize_polymarket_market(
-    market: Dict[str, Any],
-    source_url: str,
-    oi_lookup: Dict[str, float],
-) -> Dict[str, Any]:
-    outcome_prices = parse_outcome_prices(first_of(market, ["outcomePrices", "outcome_prices"]))
-    raw_price = to_float(first_of(market, ["lastTradePrice", "last_price"]))
-    if raw_price is None and outcome_prices:
-        raw_price = outcome_prices[0]
-
-    implied = normalize_probability(
-        raw_price=raw_price,
-        explicit_prob=to_float(first_of(market, ["probability", "implied_probability"])),
-    )
-
-    volume_24h = to_float(first_of(market, ["volume24hr", "volume_24h", "volume24h"]))
-    volume_total = to_float(first_of(market, ["volumeNum", "volume", "volume_total"]))
-    open_interest = to_float(first_of(market, ["openInterest", "open_interest"]))
-    if open_interest is None:
-        condition_id = first_of(market, ["conditionId", "condition_id"])
-        open_interest = oi_lookup.get(condition_id) if condition_id else None
-
-    liquidity = to_float(first_of(market, ["liquidityNum", "liquidity"]))
-    liquidity_or_oi = open_interest if open_interest is not None else liquidity
-    volume = volume_24h if volume_24h is not None else volume_total
-    volume_basis = "24h" if volume_24h is not None else ("total" if volume_total is not None else "unknown")
-
-    row = {
-        "platform": "polymarket",
-        "platform_type": "prediction_market",
-        "metric_date": datetime.now(timezone.utc).date().isoformat(),
-        "geography": "US",
-        "volume": volume,
-        "volume_basis": volume_basis,
-        "revenue": None,
-        "liquidity_or_oi": liquidity_or_oi,
-        "market_id": first_of(market, ["id", "conditionId", "slug"]),
-        "market_title": first_of(market, ["question", "title"]),
-        "category": first_of(market, ["category", "series", "tag"]),
-        "implied_probability": implied,
-        "raw_price": raw_price,
-        "volume_24h": volume_24h,
-        "volume_total": volume_total,
-        "open_interest": open_interest,
-        "status": first_of(market, ["status"]) or ("closed" if market.get("closed") else "open"),
-        "resolution": first_of(market, ["resolution", "outcome", "resolvedOutcome"]),
-        "volume_is_onchain_derived": True,
-    }
-    return add_provenance(row, source_url=source_url)
-
-
-def _fetch_polymarket_scenario(
-    client: PoliteClient,
-    gamma_base: str,
-    endpoint: str,
-    base_params: Dict[str, Any],
-    scenario_name: str,
-    scenario_params: Dict[str, Any],
-    logger,
-) -> List[Dict[str, Any]]:
-    cursor: Optional[str] = None
-    page_num = 1
-    items_out: List[Dict[str, Any]] = []
-
-    while True:
-        params = dict(base_params)
-        params.update(scenario_params)
-        if cursor:
-            params["after_cursor"] = cursor
-        response = client.get(url=f"{gamma_base}{endpoint}", params=params, use_cache=True, robots_required=False)
-        payload = json.loads(response.body.decode("utf-8"))
-        save_raw_json(source=f"polymarket_markets_{scenario_name}_p{page_num}", payload=payload)
-        items, next_cursor = _extract_polymarket_items(payload)
-        logger.info(
-            "polymarket scenario=%s page=%s rows=%s url=%s http=%s",
-            scenario_name,
-            page_num,
-            len(items),
-            response.url,
-            response.status_code,
-        )
-        items_out.extend(items)
-        page_num += 1
-        cursor = next_cursor
-        if not cursor:
-            break
-
-    return items_out
-
-
-def fetch_polymarket_markets(client: PoliteClient, cfg: Dict[str, Any], logger) -> List[Dict[str, Any]]:
+    *,
+    mode: str,
+    max_pages: int,
+    category_group_map: Dict[str, str],
+    settled_start: Optional[datetime],
+    settled_end: Optional[datetime],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     gamma_base = cfg["gamma_base_url"].rstrip("/")
     endpoint = cfg["markets_endpoint"]
     base_params = dict(cfg.get("default_params", {}))
+    scenarios = [("open", {"closed": False}), ("settled", {"closed": True})]
 
-    # Gamma commonly defaults to open/active markets; gather both open and closed
-    # snapshots to satisfy “every available market” in the spec.
-    scenarios = [
-        ("open", {"closed": False}),
-        ("closed", {"closed": True}),
-    ]
+    rows: List[Dict[str, Any]] = []
+    page_total = 0
+    market_total = 0
 
-    collected: List[Dict[str, Any]] = []
-    seen_ids: Set[str] = set()
-    condition_ids: Set[str] = set()
+    for status, scenario_params in scenarios:
+        cursor: Optional[str] = None
+        page_num = 1
+        while True:
+            check_page_cap(page_num, max_pages, f"polymarket:{status}:{mode}")
+            params = dict(base_params)
+            params.update(scenario_params)
+            if cursor:
+                params["after_cursor"] = cursor
 
-    for scenario_name, scenario_params in scenarios:
-        items = _fetch_polymarket_scenario(
-            client=client,
-            gamma_base=gamma_base,
-            endpoint=endpoint,
-            base_params=base_params,
-            scenario_name=scenario_name,
-            scenario_params=scenario_params,
-            logger=logger,
-        )
-        for item in items:
-            market_id = str(first_of(item, ["id", "conditionId", "slug"], ""))
-            if not market_id:
-                continue
-            if market_id in seen_ids:
-                continue
-            seen_ids.add(market_id)
-            collected.append(item)
-            cid = first_of(item, ["conditionId", "condition_id"])
-            if cid:
-                condition_ids.add(str(cid))
+            response = client.get(url=f"{gamma_base}{endpoint}", params=params, use_cache=True, robots_required=False)
+            payload = json.loads(response.body.decode("utf-8"))
+            save_raw_json(source=f"polymarket_{mode}_{status}_p{page_num}", payload=payload)
 
-    oi_lookup = fetch_polymarket_open_interest(
-        client=client,
-        data_api_base=cfg["data_base_url"],
-        condition_ids=sorted(condition_ids),
-        logger=logger,
-    )
-    return [normalize_polymarket_market(item, source_url=f"{gamma_base}{endpoint}", oi_lookup=oi_lookup) for item in collected]
+            markets, next_cursor = _extract_polymarket_page(payload)
+            page_total += 1
+            market_total += len(markets)
+            logger.info(
+                "polymarket mode=%s status=%s page=%s rows=%s url=%s http=%s",
+                mode,
+                status,
+                page_num,
+                len(markets),
+                response.url,
+                response.status_code,
+            )
+
+            for market in markets:
+                market_ts = extract_market_datetime(market)
+                if status == "settled" and not _filter_window(market_ts, settled_start, settled_end):
+                    continue
+                row = normalize_snapshot_row(
+                    platform="polymarket",
+                    market=market,
+                    source_url=response.url,
+                    category_group_map=category_group_map,
+                    status_override=status,
+                )
+                row["__market_ts"] = market_ts
+                rows.append(row)
+
+            if status == "open":
+                if next_cursor:
+                    logger.info("polymarket mode=%s status=open single-pass stop after page=%s", mode, page_num)
+                break
+
+            if status == "settled" and settled_start and should_stop_settled_pagination(markets, settled_start):
+                logger.info(
+                    "polymarket mode=%s status=settled stop_at_window page=%s lower_bound=%s",
+                    mode,
+                    page_num,
+                    settled_start.isoformat(),
+                )
+                break
+
+            if not next_cursor:
+                break
+
+            cursor = next_cursor
+            page_num += 1
+
+    logger.info("polymarket mode=%s pages=%s markets_seen=%s rows_kept=%s", mode, page_total, market_total, len(rows))
+    return rows, {"pages": page_total, "markets_seen": market_total, "rows_kept": len(rows)}
 
 
-def assert_valid_prediction_schema(df: pd.DataFrame) -> None:
-    missing = [col for col in EXPECTED_COLUMNS if col not in df.columns]
-    if missing:
-        raise AssertionError(f"Missing columns: {missing}")
-    for col in PROVENANCE_COLUMNS:
-        if df[col].isna().any() or (df[col].astype(str).str.strip() == "").any():
-            raise AssertionError(f"{col} must be non-null and non-empty")
-
-
-def build_prediction_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+def build_snapshot_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
-    for col in EXPECTED_COLUMNS:
+    for col in SNAPSHOT_COLUMNS:
         if col not in df.columns:
             df[col] = None
-    df = df[EXPECTED_COLUMNS]
-    assert_valid_prediction_schema(df)
+    df = df[SNAPSHOT_COLUMNS]
+    assert_provenance_populated(df, "pm_snapshot")
     return df
 
 
+def build_monthly_dataframe(snapshot_rows: List[Dict[str, Any]], start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    frame = pd.DataFrame(snapshot_rows)
+    if frame.empty:
+        df = pd.DataFrame(columns=MONTHLY_COLUMNS)
+        return df
+
+    if "__market_ts" not in frame.columns:
+        raise AssertionError("monthly build requires __market_ts in snapshot rows")
+
+    frame = frame[frame["category_group"] == "sports_event"].copy()
+    frame = frame[frame["__market_ts"].notna()].copy()
+    frame = frame[(frame["__market_ts"] >= start_dt) & (frame["__market_ts"] <= end_dt)].copy()
+
+    if frame.empty:
+        return pd.DataFrame(columns=MONTHLY_COLUMNS)
+
+    frame["month_end"] = pd.to_datetime(frame["__market_ts"], utc=True).dt.tz_convert(None).dt.to_period("M").dt.to_timestamp("M")
+
+    grouped = frame.groupby(["platform", "platform_type", "month_end", "category_group"], as_index=False).agg(
+        market_count=("market_id", "nunique"),
+        volume_24h=("volume_24h", "sum"),
+        volume_total=("volume_total", "sum"),
+        liquidity_or_oi=("liquidity_or_oi", "sum"),
+        source_url=("source_url", lambda s: ";".join(sorted(set(str(v) for v in s if str(v).strip())))),
+    )
+    grouped["month_end"] = grouped["month_end"].dt.date.astype(str)
+    grouped["volume_basis"] = "monthly_month_end_snapshot"
+
+    rows: List[Dict[str, Any]] = []
+    for _, row in grouped.iterrows():
+        record = {
+            "platform": row["platform"],
+            "platform_type": row["platform_type"],
+            "month_end": row["month_end"],
+            "category_group": row["category_group"],
+            "market_count": int(row["market_count"]),
+            "volume_24h": to_float(row["volume_24h"]),
+            "volume_total": to_float(row["volume_total"]),
+            "liquidity_or_oi": to_float(row["liquidity_or_oi"]),
+            "volume_basis": row["volume_basis"],
+        }
+        rows.append(add_provenance(record, source_url=row["source_url"]))
+
+    out = pd.DataFrame(rows)
+    for col in MONTHLY_COLUMNS:
+        if col not in out.columns:
+            out[col] = None
+    out = out[MONTHLY_COLUMNS]
+    assert_provenance_populated(out, "pm_monthly")
+    return out
+
+
+def assert_provenance_populated(df: pd.DataFrame, label: str) -> None:
+    missing = [col for col in PROVENANCE_COLUMNS if col not in df.columns]
+    if missing:
+        raise AssertionError(f"{label} missing provenance columns: {missing}")
+    for col in PROVENANCE_COLUMNS:
+        if df[col].isna().any() or (df[col].astype(str).str.strip() == "").any():
+            raise AssertionError(f"{label} has null/blank values in {col}")
+
+
+def load_mode_config(config: Dict[str, Any]) -> Tuple[Dict[str, str], int, int, datetime, datetime]:
+    pm_cfg = config["prediction_markets"]
+    category_group_map_raw = pm_cfg.get("category_group_map", {})
+    category_group_map = {canonical_key(str(k)): str(v) for k, v in category_group_map_raw.items()}
+    if not category_group_map:
+        category_group_map = {"sports": "sports_event"}
+
+    snapshot_lookback_days = int(pm_cfg.get("snapshot_lookback_days", 90))
+    max_pages = int(pm_cfg.get("max_pages", 25))
+
+    series_start = pd.to_datetime(pm_cfg.get("series_start"), utc=True, errors="coerce")
+    series_end = pd.to_datetime(pm_cfg.get("series_end"), utc=True, errors="coerce")
+    if pd.isna(series_start) or pd.isna(series_end):
+        raise ValueError("prediction_markets.series_start and series_end must be valid ISO dates")
+
+    return (
+        category_group_map,
+        snapshot_lookback_days,
+        max_pages,
+        series_start.to_pydatetime(),
+        series_end.to_pydatetime(),
+    )
+
+
+def collect_snapshot_mode(client: PoliteClient, config: Dict[str, Any], logger) -> pd.DataFrame:
+    pm_cfg = config["prediction_markets"]
+    category_group_map, snapshot_lookback_days, max_pages, _, _ = load_mode_config(config)
+
+    now_utc = datetime.now(timezone.utc)
+    settled_start = now_utc - timedelta(days=snapshot_lookback_days)
+
+    kalshi_rows, kalshi_stats = fetch_kalshi_rows(
+        client,
+        pm_cfg["kalshi"],
+        logger,
+        mode="snapshot",
+        max_pages=max_pages,
+        category_group_map=category_group_map,
+        settled_start=settled_start,
+        settled_end=now_utc,
+    )
+    polymarket_rows, polymarket_stats = fetch_polymarket_rows(
+        client,
+        pm_cfg["polymarket"],
+        logger,
+        mode="snapshot",
+        max_pages=max_pages,
+        category_group_map=category_group_map,
+        settled_start=settled_start,
+        settled_end=now_utc,
+    )
+
+    rows = kalshi_rows + polymarket_rows
+    df = build_snapshot_dataframe(rows)
+    df.to_csv(SNAPSHOT_OUTPUT_PATH, index=False)
+    logger.info(
+        "snapshot_complete rows=%s output=%s kalshi_pages=%s polymarket_pages=%s",
+        len(df),
+        SNAPSHOT_OUTPUT_PATH,
+        kalshi_stats["pages"],
+        polymarket_stats["pages"],
+    )
+    return df
+
+
+def collect_monthly_mode(client: PoliteClient, config: Dict[str, Any], logger) -> pd.DataFrame:
+    pm_cfg = config["prediction_markets"]
+    category_group_map, _, max_pages, series_start, series_end = load_mode_config(config)
+
+    kalshi_rows, kalshi_stats = fetch_kalshi_rows(
+        client,
+        pm_cfg["kalshi"],
+        logger,
+        mode="monthly",
+        max_pages=max_pages,
+        category_group_map=category_group_map,
+        settled_start=series_start,
+        settled_end=series_end,
+    )
+    polymarket_rows, polymarket_stats = fetch_polymarket_rows(
+        client,
+        pm_cfg["polymarket"],
+        logger,
+        mode="monthly",
+        max_pages=max_pages,
+        category_group_map=category_group_map,
+        settled_start=series_start,
+        settled_end=series_end,
+    )
+
+    monthly_df = build_monthly_dataframe(kalshi_rows + polymarket_rows, start_dt=series_start, end_dt=series_end)
+    monthly_df.to_csv(MONTHLY_OUTPUT_PATH, index=False)
+    logger.info(
+        "monthly_complete rows=%s output=%s kalshi_pages=%s polymarket_pages=%s",
+        len(monthly_df),
+        MONTHLY_OUTPUT_PATH,
+        kalshi_stats["pages"],
+        polymarket_stats["pages"],
+    )
+    return monthly_df
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Bounded prediction market collector")
+    parser.add_argument(
+        "--mode",
+        choices=["snapshot", "monthly"],
+        default="snapshot",
+        help="snapshot=structural market snapshot, monthly=sports_event monthly time series",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     ensure_project_dirs()
     config = load_config("config.yaml")
     logger, log_path = configure_logger("collect_prediction_markets")
     client = PoliteClient(config=config, logger=logger)
-    logger.info("Run started log_path=%s", log_path)
+    logger.info("Run started log_path=%s mode=%s", log_path, args.mode)
 
-    kalshi_rows = fetch_kalshi_markets(client, config["prediction_markets"]["kalshi"], logger)
-    polymarket_rows = fetch_polymarket_markets(client, config["prediction_markets"]["polymarket"], logger)
-    rows = kalshi_rows + polymarket_rows
+    if args.mode == "snapshot":
+        collect_snapshot_mode(client, config, logger)
+    else:
+        collect_monthly_mode(client, config, logger)
 
-    df = build_prediction_dataframe(rows)
-    df.to_csv(OUTPUT_PATH, index=False)
-    logger.info(
-        "Wrote rows=%s output=%s kalshi_rows=%s polymarket_rows=%s",
-        len(df),
-        OUTPUT_PATH,
-        len(kalshi_rows),
-        len(polymarket_rows),
-    )
+    logger.info("Run finished mode=%s", args.mode)
 
 
 if __name__ == "__main__":
