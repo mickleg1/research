@@ -312,6 +312,144 @@ def parse_ny_statewide_excel(path: str, source_url: str, logger) -> Tuple[List[D
     return rows, empty_sheets
 
 
+
+def _parse_numeric_candidates(line: str) -> List[float]:
+    candidates: List[float] = []
+    for token in re.findall(r"\(?\$?\s*-?\d[\d,\s]*(?:\.\d+)?\)?", line):
+        raw = token.strip()
+        if not raw:
+            continue
+        cleaned = raw.replace("$", "").replace(",", "").replace(" ", "")
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = "-" + cleaned[1:-1]
+        if cleaned in {"", "-"}:
+            continue
+        try:
+            value = float(cleaned)
+        except ValueError:
+            continue
+
+        # Skip small row numbers / indices.
+        has_comma = "," in raw
+        if abs(value) < 1000 and not has_comma:
+            continue
+        candidates.append(value)
+    return candidates
+
+
+def _extract_nj_operator(text: str) -> Optional[str]:
+    match = re.search(
+        r"^\s*([A-Z0-9&.,'/ -]+?)\s*\n\s*(?:MONTHLY SPORTS WAGERING TAX RETURN|ONLINE SPORTS WAGERING SKIN DETAIL REPORT)",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if match:
+        return " ".join(match.group(1).split())
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _extract_nj_month(text: str) -> Optional[str]:
+    m = re.search(r"FOR THE MONTH OF\s+([A-Z]+)\s+(20\d{2})", text, flags=re.IGNORECASE)
+    if not m:
+        return parse_month_from_text(text)
+    month_name = m.group(1).lower()
+    year = m.group(2)
+    month_num = MONTH_NAME_TO_NUM.get(month_name)
+    if not month_num:
+        return parse_month_from_text(text)
+    return f"{year}-{month_num}"
+
+
+def _extract_nj_gross_revenue(text: str) -> Optional[float]:
+    lines = text.splitlines()
+    priorities = [
+        "monthly online sports wagering gross revenue",
+        "monthly online sportsbook gross revenue",
+        "monthly online sports wagering gross",
+    ]
+
+    for needle in priorities:
+        for line in lines:
+            if needle in line.lower():
+                values = _parse_numeric_candidates(line)
+                if values:
+                    return values[0]
+
+    for line in lines:
+        lower = line.lower()
+        if "monthly" in lower and "gross revenue" in lower and "online" in lower:
+            values = _parse_numeric_candidates(line)
+            if values:
+                return values[0]
+
+    return None
+
+
+def _extract_nj_handle(text: str) -> Optional[float]:
+    handle_needles = [
+        "total handle",
+        "amount wagered",
+        "sports wagering handle",
+        "wagers accepted",
+    ]
+    for line in text.splitlines():
+        lower = line.lower()
+        if any(needle in lower for needle in handle_needles):
+            values = _parse_numeric_candidates(line)
+            if values:
+                return values[0]
+    return None
+
+
+def parse_nj_monthly_pdf(path: str, source_url: str, logger) -> Tuple[Optional[Dict[str, Any]], str]:
+    with pdfplumber.open(path) as pdf:
+        page_texts: List[str] = []
+        for page in pdf.pages:
+            page_texts.append(page.extract_text() or "")
+
+    full_text = "\n".join(page_texts)
+    if not full_text.strip():
+        return None, "empty_text"
+
+    operator = _extract_nj_operator(full_text)
+    month = _extract_nj_month(full_text)
+    gross_revenue = _extract_nj_gross_revenue(full_text)
+    handle = _extract_nj_handle(full_text)
+
+    if not operator:
+        return None, "missing_operator"
+    if not month:
+        return None, "missing_month"
+    if gross_revenue is None:
+        return None, "missing_monthly_online_gross_revenue"
+
+    volume = handle if handle is not None else gross_revenue
+    volume_basis = "monthly_handle" if handle is not None else "monthly_revenue"
+
+    record = {
+        "platform": operator,
+        "platform_type": "sportsbook",
+        "metric_date": f"{month}-01",
+        "geography": "NJ",
+        "volume": volume,
+        "volume_basis": volume_basis,
+        "revenue": gross_revenue,
+        "liquidity_or_oi": None,
+        "state": "NJ",
+        "month": month,
+        "operator": operator,
+        "handle": handle,
+        "gross_revenue": gross_revenue,
+        "validation_status": "parsed_nj_text",
+    }
+    return add_provenance(record, source_url=source_url), "ok"
+
+
 def dataframe_views(df: pd.DataFrame) -> List[pd.DataFrame]:
     views: List[pd.DataFrame] = [df]
     limit = min(5, len(df) - 1)
@@ -613,6 +751,23 @@ def collect_state_reports(
 
             if empty_sheets:
                 move_to_needs_review(raw_path, reason=f"sheet_no_rows:{','.join(empty_sheets[:5])}", logger=logger)
+
+        elif state_code == "NJ" and ext == "pdf":
+            try:
+                nj_row, reason = parse_nj_monthly_pdf(raw_path, source_url=result.url, logger=logger)
+            except Exception as exc:
+                logger.warning("parse_failed state=%s file=%s err=%s", state_code, raw_path, exc)
+                move_to_needs_review(raw_path, reason=f"parse_failed:{exc}", logger=logger)
+                continue
+
+            if nj_row is not None:
+                parsed_any = True
+                records.append(nj_row)
+                layout_state["last_successful_fingerprint"] = "nj_text_monthly_online_gross_revenue"
+                layout_state["last_successful_source"] = result.url
+            else:
+                logger.warning("nj_text_parse_failed file=%s reason=%s", raw_path, reason)
+
         else:
             try:
                 tables = parse_pdf_tables(raw_path, logger=logger) if ext == "pdf" else parse_spreadsheet(raw_path)
