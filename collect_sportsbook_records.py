@@ -86,6 +86,8 @@ def canonical_col(name: str) -> str:
 def to_float(value: Any) -> Optional[float]:
     if value is None:
         return None
+    if pd.isna(value):
+        return None
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
@@ -550,6 +552,22 @@ def collect_state_reports(
         )
         final_parsed = urlparse(result.url)
         ext = Path(final_parsed.path).suffix.lower().lstrip(".")
+        if ext not in {"pdf", "csv", "xlsx", "xls"}:
+            # Cached short-link responses can hide redirect target extension.
+            link_ext = Path(urlparse(link).path).suffix.lower().lstrip(".")
+            if link_ext in {"pdf", "csv", "xlsx", "xls"}:
+                ext = link_ext
+            else:
+                result = client_get_with_state_ua(
+                    client,
+                    link,
+                    use_cache=False,
+                    robots_required=False,
+                    user_agent_override=ua_override,
+                )
+                final_parsed = urlparse(result.url)
+                ext = Path(final_parsed.path).suffix.lower().lstrip(".")
+
         if ext not in {"pdf", "csv", "xlsx", "xls"}:
             logger.info("skip_non_report_file state=%s requested=%s resolved=%s", state_code, link, result.url)
             continue
