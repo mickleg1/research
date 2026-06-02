@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
@@ -253,6 +254,62 @@ def parse_spreadsheet(path: str) -> List[pd.DataFrame]:
     return dfs
 
 
+def parse_ny_statewide_excel(path: str, source_url: str, logger) -> Tuple[List[Dict[str, Any]], List[str]]:
+    xls = pd.ExcelFile(path)
+    rows: List[Dict[str, Any]] = []
+    empty_sheets: List[str] = []
+
+    for sheet in xls.sheet_names:
+        raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
+        sheet_rows = 0
+        if len(raw) <= 13:
+            empty_sheets.append(sheet)
+            logger.warning("ny_sheet_no_rows file=%s sheet=%s reason=insufficient_rows", path, sheet)
+            continue
+
+        # Per provided structure: row 12 is header, row 13 starts data.
+        for row_idx in range(13, len(raw)):
+            month_raw = raw.iat[row_idx, 0] if raw.shape[1] > 0 else None
+            handle_raw = raw.iat[row_idx, 2] if raw.shape[1] > 2 else None
+            ggr_raw = raw.iat[row_idx, 3] if raw.shape[1] > 3 else None
+
+            month_dt = pd.to_datetime(month_raw, errors="coerce")
+            if pd.isna(month_dt):
+                continue
+
+            handle = to_float(handle_raw)
+            gross_revenue = to_float(ggr_raw)
+            if handle is None and gross_revenue is None:
+                continue
+
+            month_value = month_dt.strftime("%Y-%m")
+            metric_date = month_dt.strftime("%Y-%m-%d")
+            record = {
+                "platform": "statewide_total",
+                "platform_type": "sportsbook",
+                "metric_date": metric_date,
+                "geography": "NY",
+                "volume": handle,
+                "volume_basis": "monthly_handle",
+                "revenue": gross_revenue,
+                "liquidity_or_oi": None,
+                "state": "NY",
+                "month": month_value,
+                "operator": "STATEWIDE_TOTAL",
+                "handle": handle,
+                "gross_revenue": gross_revenue,
+                "validation_status": "statewide_total",
+            }
+            rows.append(add_provenance(record, source_url=source_url))
+            sheet_rows += 1
+
+        if sheet_rows == 0:
+            empty_sheets.append(sheet)
+            logger.warning("ny_sheet_no_rows file=%s sheet=%s reason=no_data_rows", path, sheet)
+
+    return rows, empty_sheets
+
+
 def dataframe_views(df: pd.DataFrame) -> List[pd.DataFrame]:
     views: List[pd.DataFrame] = [df]
     limit = min(5, len(df) - 1)
@@ -481,6 +538,7 @@ def collect_state_reports(
         report_links.extend(links)
 
     report_links.extend([str(x) for x in state_cfg.get("report_urls", []) if str(x).strip()])
+    ny_seen_months: Set[str] = set()
 
     for link in sorted(set(report_links), key=_link_priority):
         result = client_get_with_state_ua(
@@ -510,53 +568,81 @@ def collect_state_reports(
         )
         logger.info("downloaded state=%s file=%s month=%s source=%s resolved=%s", state_code, raw_path, month, link, result.url)
 
-        try:
-            tables = parse_pdf_tables(raw_path, logger=logger) if ext == "pdf" else parse_spreadsheet(raw_path)
-        except Exception as exc:
-            logger.warning("parse_failed state=%s file=%s err=%s", state_code, raw_path, exc)
-            move_to_needs_review(raw_path, reason=f"parse_failed:{exc}", logger=logger)
-            continue
-
-        if month is None:
-            month = infer_month_from_tables(tables)
-
         parsed_any = False
-        for table in tables:
-            if table.empty:
+        if state_code == "NY" and ext in {"xlsx", "xls"}:
+            try:
+                ny_rows, empty_sheets = parse_ny_statewide_excel(raw_path, source_url=result.url, logger=logger)
+            except Exception as exc:
+                logger.warning("parse_failed state=%s file=%s err=%s", state_code, raw_path, exc)
+                move_to_needs_review(raw_path, reason=f"parse_failed:{exc}", logger=logger)
                 continue
 
-            for view in dataframe_views(table):
-                extracted, matched, summary = extract_operator_rows(
-                    view,
-                    state_code=state_code,
-                    month=month,
-                    alias_map=alias_map,
-                    source_url=result.url,
-                )
-                if not matched:
+            deduped_rows: List[Dict[str, Any]] = []
+            for row in ny_rows:
+                month_key = str(row.get("month") or "")
+                if not month_key:
+                    continue
+                if month_key in ny_seen_months:
+                    continue
+                ny_seen_months.add(month_key)
+                deduped_rows.append(row)
+
+            if deduped_rows:
+                parsed_any = True
+                records.extend(deduped_rows)
+                layout_state["last_successful_fingerprint"] = "ny_statewide_header_row_12"
+                layout_state["last_successful_source"] = result.url
+
+            if empty_sheets:
+                move_to_needs_review(raw_path, reason=f"sheet_no_rows:{','.join(empty_sheets[:5])}", logger=logger)
+        else:
+            try:
+                tables = parse_pdf_tables(raw_path, logger=logger) if ext == "pdf" else parse_spreadsheet(raw_path)
+            except Exception as exc:
+                logger.warning("parse_failed state=%s file=%s err=%s", state_code, raw_path, exc)
+                move_to_needs_review(raw_path, reason=f"parse_failed:{exc}", logger=logger)
+                continue
+
+            if month is None:
+                month = infer_month_from_tables(tables)
+
+            for table in tables:
+                if table.empty:
                     continue
 
-                fp = fingerprint_dataframe(view)
-                last_fp = layout_state.get("last_successful_fingerprint")
-                if last_fp and last_fp != fp:
-                    move_to_needs_review(raw_path, reason="layout_fingerprint_changed", logger=logger)
-                    parsed_any = False
-                    extracted = []
+                for view in dataframe_views(table):
+                    extracted, matched, summary = extract_operator_rows(
+                        view,
+                        state_code=state_code,
+                        month=month,
+                        alias_map=alias_map,
+                        source_url=result.url,
+                    )
+                    if not matched:
+                        continue
+
+                    fp = fingerprint_dataframe(view)
+                    last_fp = layout_state.get("last_successful_fingerprint")
+                    if last_fp and last_fp != fp:
+                        move_to_needs_review(raw_path, reason="layout_fingerprint_changed", logger=logger)
+                        parsed_any = False
+                        extracted = []
+                        break
+
+                    parsed_any = True
+                    records.extend(extracted)
+                    layout_state["last_successful_fingerprint"] = fp
+                    layout_state["last_successful_source"] = result.url
+                    if month and summary is not None:
+                        summary_totals[(state_code, month)] = summary
                     break
 
-                parsed_any = True
-                records.extend(extracted)
-                layout_state["last_successful_fingerprint"] = fp
-                layout_state["last_successful_source"] = result.url
-                if month and summary is not None:
-                    summary_totals[(state_code, month)] = summary
-                break
-
-            if parsed_any:
-                break
+                if parsed_any:
+                    break
 
         if not parsed_any:
             logger.warning("no_operator_rows_or_layout_changed state=%s file=%s", state_code, raw_path)
+            move_to_needs_review(raw_path, reason="no_rows_extracted", logger=logger)
 
     apply_reconciliation(records, summary_totals)
     save_layout_state(state_code, layout_state)
@@ -571,7 +657,18 @@ def build_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
     return df[EXPECTED_COLUMNS]
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Collect sportsbook records from configured states")
+    parser.add_argument(
+        "--states",
+        default="",
+        help="Comma-separated state codes to run (e.g., NY or NJ,PA,NY). Empty means all configured states.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     ensure_project_dirs()
     config = load_config("config.yaml")
     logger, log_path = configure_logger("collect_sportsbook_records")
@@ -580,13 +677,18 @@ def main() -> None:
 
     all_records: List[Dict[str, Any]] = []
     states_cfg = config.get("sportsbook_records", {}).get("states", {})
+    selected_states = {s.strip().upper() for s in args.states.split(",") if s.strip()}
+
     for state_code, state_cfg in states_cfg.items():
+        if selected_states and state_code.upper() not in selected_states:
+            continue
         logger.info("Collecting state=%s regulator=%s", state_code, state_cfg.get("regulator"))
         all_records.extend(collect_state_reports(client, state_code, state_cfg, logger))
 
     df = build_dataframe(all_records)
     df.to_csv(OUTPUT_PATH, index=False)
     logger.info("Wrote %s rows to %s", len(df), OUTPUT_PATH)
+
 
 
 if __name__ == "__main__":
