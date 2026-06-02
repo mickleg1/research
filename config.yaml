@@ -15,7 +15,7 @@ prediction_markets:
     default_params:
       limit: 100
   snapshot_lookback_days: 90
-  max_pages: 25
+  max_pages: 200
   series_start: '2024-01-01'
   series_end: '2026-12-31'
   category_group_map:

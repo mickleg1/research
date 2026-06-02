@@ -343,9 +343,15 @@ def fetch_kalshi_rows(
                 rows.append(row)
 
             if status == "open":
-                # Snapshot mode is intentionally single-pass for current opens.
+                # Current-open collection is a single pass in both modes.
                 if next_cursor:
                     logger.info("kalshi mode=%s status=open single-pass stop after page=%s", mode, page_num)
+                break
+
+            if status == "settled" and mode == "snapshot":
+                # Structural snapshot mode is explicitly single-pass.
+                if next_cursor:
+                    logger.info("kalshi mode=%s status=settled single-pass stop after page=%s", mode, page_num)
                 break
 
             if status == "settled" and settled_start and should_stop_settled_pagination(markets, settled_start):
@@ -431,6 +437,11 @@ def fetch_polymarket_rows(
             if status == "open":
                 if next_cursor:
                     logger.info("polymarket mode=%s status=open single-pass stop after page=%s", mode, page_num)
+                break
+
+            if status == "settled" and mode == "snapshot":
+                if next_cursor:
+                    logger.info("polymarket mode=%s status=settled single-pass stop after page=%s", mode, page_num)
                 break
 
             if status == "settled" and settled_start and should_stop_settled_pagination(markets, settled_start):
