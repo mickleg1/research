@@ -83,7 +83,7 @@ def prepare_metrics(metrics_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     out["metric_date"] = pd.to_datetime(out["metric_date"], errors="coerce", utc=True)
-    out["metric_month"] = out["metric_date"].dt.to_period("M").dt.to_timestamp()
+    out["metric_month"] = out["metric_date"].dt.tz_convert(None).dt.to_period("M").dt.to_timestamp()
 
     if "month" in out.columns:
         month_series = out["month"].astype(str)
@@ -521,9 +521,8 @@ def write_captions(results: Sequence[ExhibitResult]) -> None:
     for result in results:
         lines.append(result.caption)
         lines.append("")
-    CAPTIONS_PATH.write_text("
-".join(lines).strip() + "
-", encoding="utf-8")
+    CAPTIONS_PATH.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
 
 
 def main() -> None:
