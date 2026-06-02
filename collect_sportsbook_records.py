@@ -22,11 +22,35 @@ from collector_common import (
 
 OUTPUT_PATH = "processed/sportsbook_records.csv"
 REPORT_LINK_PATTERN = re.compile(
-    r'<a[^>]+href=[\'"]([^\'"]+\.(?:pdf|csv|xlsx|xls))[\'"][^>]*>(.*?)</a>',
+    r"<a[^>]+href=[\"']([^\"']+\.(?:pdf|csv|xlsx|xls))[\"'][^>]*>(.*?)</a>",
     re.IGNORECASE | re.DOTALL,
 )
-MONTH_PATTERN = re.compile(r"(20\d{2})[-_ ]?(0[1-9]|1[0-2])")
+MONTH_PATTERN = re.compile(r"(20\d{2})[-_/ ]?(0[1-9]|1[0-2])")
+MONTH_COMPACT_PATTERN = re.compile(r"(20\d{2})(0[1-9]|1[0-2])")
+MONTH_NAME_PATTERN = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|october|november|december)[-_ ]*(20\d{2})\b",
+    re.IGNORECASE,
+)
+MONTH_NAME_REVERSE_PATTERN = re.compile(
+    r"\b(20\d{2})[-_ ]*(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+    re.IGNORECASE,
+)
 REPORT_KEYWORDS = ("sports", "wager", "bet", "revenue", "handle", "gaming win", "ggr")
+
+MONTH_NAME_TO_NUM = {
+    "january": "01",
+    "february": "02",
+    "march": "03",
+    "april": "04",
+    "may": "05",
+    "june": "06",
+    "july": "07",
+    "august": "08",
+    "september": "09",
+    "october": "10",
+    "november": "11",
+    "december": "12",
+}
 
 CORE_COLUMNS = [
     "platform",
@@ -75,20 +99,83 @@ def to_float(value: Any) -> Optional[float]:
 
 
 def parse_month_from_text(text: str) -> Optional[str]:
-    match = MONTH_PATTERN.search(text)
-    if not match:
+    if not text:
         return None
-    return f"{match.group(1)}-{match.group(2)}"
+
+    match = MONTH_PATTERN.search(text)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+
+    compact = MONTH_COMPACT_PATTERN.search(text)
+    if compact:
+        return f"{compact.group(1)}-{compact.group(2)}"
+
+    month_name = MONTH_NAME_PATTERN.search(text)
+    if month_name:
+        month_num = MONTH_NAME_TO_NUM[month_name.group(1).lower()]
+        return f"{month_name.group(2)}-{month_num}"
+
+    reverse_name = MONTH_NAME_REVERSE_PATTERN.search(text)
+    if reverse_name:
+        month_num = MONTH_NAME_TO_NUM[reverse_name.group(2).lower()]
+        return f"{reverse_name.group(1)}-{month_num}"
+
+    return None
 
 
-def discover_report_links(base_url: str, html: str) -> List[str]:
+def discover_report_links(
+    base_url: str,
+    html: str,
+    include_keywords: Optional[List[str]] = None,
+    exclude_keywords: Optional[List[str]] = None,
+) -> List[str]:
     links: List[str] = []
+    include = [kw.lower() for kw in (include_keywords or []) if str(kw).strip()]
+    exclude = [kw.lower() for kw in (exclude_keywords or []) if str(kw).strip()]
+
     for href, anchor_text in REPORT_LINK_PATTERN.findall(html):
-        haystack = f"{href} {anchor_text}".lower()
-        if not any(keyword in haystack for keyword in REPORT_KEYWORDS):
+        full_url = urljoin(base_url, href)
+        haystack = f"{full_url} {anchor_text}".lower()
+
+        if include:
+            if not any(keyword in haystack for keyword in include):
+                continue
+        else:
+            if not any(keyword in haystack for keyword in REPORT_KEYWORDS):
+                continue
+
+        if exclude and any(keyword in haystack for keyword in exclude):
             continue
-        links.append(urljoin(base_url, href))
+
+        links.append(full_url)
+
     return sorted(set(links))
+
+
+def _link_priority(url: str) -> Tuple[int, str]:
+    lower = url.lower()
+    # Prefer machine-readable files first.
+    if lower.endswith(".csv"):
+        return (0, lower)
+    if lower.endswith(".xlsx"):
+        return (1, lower)
+    if lower.endswith(".xls"):
+        return (2, lower)
+    if lower.endswith(".pdf"):
+        return (3, lower)
+    return (4, lower)
+
+
+def infer_month_from_tables(tables: List[pd.DataFrame]) -> Optional[str]:
+    for table in tables:
+        if table.empty:
+            continue
+        sample = table.head(8).astype(str)
+        text_blob = " ".join(" ".join(row) for row in sample.values.tolist())
+        month = parse_month_from_text(text_blob)
+        if month:
+            return month
+    return None
 
 
 def state_raw_dir(state_code: str) -> Path:
@@ -158,12 +245,27 @@ def parse_pdf_tables(path: str, logger) -> List[pd.DataFrame]:
 def parse_spreadsheet(path: str) -> List[pd.DataFrame]:
     dfs: List[pd.DataFrame] = []
     if path.lower().endswith(".csv"):
-        dfs.append(pd.read_csv(path))
+        dfs.append(pd.read_csv(path, dtype=str))
         return dfs
     xls = pd.ExcelFile(path)
     for sheet in xls.sheet_names:
-        dfs.append(pd.read_excel(xls, sheet_name=sheet))
+        dfs.append(pd.read_excel(xls, sheet_name=sheet, dtype=str))
     return dfs
+
+
+def dataframe_views(df: pd.DataFrame) -> List[pd.DataFrame]:
+    views: List[pd.DataFrame] = [df]
+    limit = min(5, len(df) - 1)
+    for header_row in range(0, max(limit, 0)):
+        candidate = df.copy()
+        header = [str(x).strip() if x is not None else "" for x in candidate.iloc[header_row].tolist()]
+        if sum(1 for h in header if h) < 2:
+            continue
+        body = candidate.iloc[header_row + 1 :].copy()
+        body.columns = header
+        body = body.reset_index(drop=True)
+        views.append(body)
+    return views
 
 
 def find_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -193,11 +295,40 @@ def extract_operator_rows(
     alias_map: Dict[str, str],
     source_url: str,
 ) -> Tuple[List[Dict[str, Any]], bool, Optional[Tuple[float, float]]]:
-    operator_col = find_column(df, ["operator", "licensee", "partner", "brand"])
-    handle_col = find_column(df, ["handle", "wagersaccepted", "amountwagered", "totalsportswageringhandle"])
+    operator_col = find_column(
+        df,
+        [
+            "operator",
+            "operatorname",
+            "licensee",
+            "partner",
+            "brand",
+            "sportswageringoperator",
+            "sportsbook",
+        ],
+    )
+    handle_col = find_column(
+        df,
+        [
+            "handle",
+            "wagersaccepted",
+            "amountwagered",
+            "totalsportswageringhandle",
+            "sportswageringhandle",
+            "totalhandle",
+        ],
+    )
     revenue_col = find_column(
         df,
-        ["grossrevenue", "grossgamingrevenue", "sportswageringgrossrevenue", "ggr", "revenue"],
+        [
+            "grossrevenue",
+            "grossgamingrevenue",
+            "sportswageringgrossrevenue",
+            "ggr",
+            "revenue",
+            "taxablegrossrevenue",
+            "totalgrossrevenue",
+        ],
     )
 
     if not operator_col or not handle_col or not revenue_col:
@@ -216,7 +347,8 @@ def extract_operator_rows(
         handle_val = to_float(row.get(handle_col))
         revenue_val = to_float(row.get(revenue_col))
 
-        if "total" in op_str.lower() or "statewide" in op_str.lower():
+        lowered = op_str.lower()
+        if "total" in lowered or "statewide" in lowered:
             if total_handle is None and handle_val is not None:
                 total_handle = handle_val
             if total_revenue is None and revenue_val is not None:
@@ -281,12 +413,34 @@ def apply_reconciliation(
         sum_handle = sum((r.get("handle") or 0.0) for r in recs)
         sum_revenue = sum((r.get("gross_revenue") or 0.0) for r in recs)
 
-        # "within rounding" tolerance
         handle_ok = abs(sum_handle - expected_handle) <= 1.0
         revenue_ok = abs(sum_revenue - expected_revenue) <= 1.0
         status = "reconciled" if handle_ok and revenue_ok else "mismatch"
         for rec in recs:
             rec["validation_status"] = status
+
+
+def client_get_with_state_ua(
+    client: PoliteClient,
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    use_cache: bool = True,
+    robots_required: bool = False,
+    user_agent_override: Optional[str] = None,
+):
+    if not user_agent_override:
+        return client.get(url, params=params, use_cache=use_cache, robots_required=robots_required)
+
+    original_ua = client.session.headers.get("User-Agent")
+    client.session.headers["User-Agent"] = user_agent_override
+    try:
+        return client.get(url, params=params, use_cache=use_cache, robots_required=robots_required)
+    finally:
+        if original_ua is None:
+            client.session.headers.pop("User-Agent", None)
+        else:
+            client.session.headers["User-Agent"] = original_ua
 
 
 def collect_state_reports(
@@ -299,38 +453,62 @@ def collect_state_reports(
     alias_map = state_cfg.get("operator_aliases", {})
     layout_state = load_layout_state(state_code)
     summary_totals: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    ua_override = state_cfg.get("user_agent_override")
+    include_keywords = state_cfg.get("report_link_include_keywords", [])
+    exclude_keywords = state_cfg.get("report_link_exclude_keywords", [])
 
     report_links: List[str] = []
     for index_url in state_cfg.get("report_index_urls", []):
         try:
-            response = client.get(index_url, use_cache=True, robots_required=True)
+            response = client_get_with_state_ua(
+                client,
+                index_url,
+                use_cache=True,
+                robots_required=True,
+                user_agent_override=ua_override,
+            )
         except PermissionError as exc:
             logger.warning("index_blocked_by_robots state=%s index=%s err=%s", state_code, index_url, exc)
             continue
+
         if response.status_code >= 400:
             logger.warning("index_fetch_failed state=%s index=%s status=%s", state_code, index_url, response.status_code)
             continue
 
         html = response.body.decode("utf-8", errors="ignore")
-        links = discover_report_links(index_url, html)
+        links = discover_report_links(index_url, html, include_keywords=include_keywords, exclude_keywords=exclude_keywords)
         logger.info("state=%s index=%s links_found=%s", state_code, index_url, len(links))
         report_links.extend(links)
 
-    for link in sorted(set(report_links)):
-        parsed = urlparse(link)
-        ext = Path(parsed.path).suffix.lower().lstrip(".")
+    report_links.extend([str(x) for x in state_cfg.get("report_urls", []) if str(x).strip()])
+
+    for link in sorted(set(report_links), key=_link_priority):
+        result = client_get_with_state_ua(
+            client,
+            link,
+            use_cache=True,
+            robots_required=False,
+            user_agent_override=ua_override,
+        )
+        final_parsed = urlparse(result.url)
+        ext = Path(final_parsed.path).suffix.lower().lstrip(".")
         if ext not in {"pdf", "csv", "xlsx", "xls"}:
+            logger.info("skip_non_report_file state=%s requested=%s resolved=%s", state_code, link, result.url)
             continue
 
-        result = client.get(link, use_cache=True, robots_required=False)
         raw_path = save_raw_bytes(
             source=f"{state_code.lower()}_{ext}",
             ext=ext,
             content=result.body,
             subdir=str(state_raw_dir(state_code)),
         )
-        month = parse_month_from_text(Path(parsed.path).name) or parse_month_from_text(link)
-        logger.info("downloaded state=%s file=%s month=%s", state_code, raw_path, month)
+
+        month = (
+            parse_month_from_text(Path(final_parsed.path).name)
+            or parse_month_from_text(result.url)
+            or parse_month_from_text(link)
+        )
+        logger.info("downloaded state=%s file=%s month=%s source=%s resolved=%s", state_code, raw_path, month, link, result.url)
 
         try:
             tables = parse_pdf_tables(raw_path, logger=logger) if ext == "pdf" else parse_spreadsheet(raw_path)
@@ -339,35 +517,43 @@ def collect_state_reports(
             move_to_needs_review(raw_path, reason=f"parse_failed:{exc}", logger=logger)
             continue
 
+        if month is None:
+            month = infer_month_from_tables(tables)
+
         parsed_any = False
         for table in tables:
             if table.empty:
                 continue
-            extracted, matched, summary = extract_operator_rows(
-                table,
-                state_code=state_code,
-                month=month,
-                alias_map=alias_map,
-                source_url=link,
-            )
-            if not matched:
-                continue
 
-            # Compare against last successful parse layout for this state.
-            fp = fingerprint_dataframe(table)
-            last_fp = layout_state.get("last_successful_fingerprint")
-            if last_fp and last_fp != fp:
-                move_to_needs_review(raw_path, reason="layout_fingerprint_changed", logger=logger)
-                parsed_any = False
-                extracted = []
+            for view in dataframe_views(table):
+                extracted, matched, summary = extract_operator_rows(
+                    view,
+                    state_code=state_code,
+                    month=month,
+                    alias_map=alias_map,
+                    source_url=result.url,
+                )
+                if not matched:
+                    continue
+
+                fp = fingerprint_dataframe(view)
+                last_fp = layout_state.get("last_successful_fingerprint")
+                if last_fp and last_fp != fp:
+                    move_to_needs_review(raw_path, reason="layout_fingerprint_changed", logger=logger)
+                    parsed_any = False
+                    extracted = []
+                    break
+
+                parsed_any = True
+                records.extend(extracted)
+                layout_state["last_successful_fingerprint"] = fp
+                layout_state["last_successful_source"] = result.url
+                if month and summary is not None:
+                    summary_totals[(state_code, month)] = summary
                 break
 
-            parsed_any = True
-            records.extend(extracted)
-            layout_state["last_successful_fingerprint"] = fp
-            layout_state["last_successful_source"] = link
-            if month and summary is not None:
-                summary_totals[(state_code, month)] = summary
+            if parsed_any:
+                break
 
         if not parsed_any:
             logger.warning("no_operator_rows_or_layout_changed state=%s file=%s", state_code, raw_path)

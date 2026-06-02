@@ -42,7 +42,7 @@ sportsbook_records:
     NJ:
       regulator: New Jersey Division of Gaming Enforcement
       report_index_urls:
-      - https://www.nj.gov/oag/ge/financials.html
+      - https://www.njoag.gov/about/divisions-and-offices/division-of-gaming-enforcement-home/financial-and-statistical-information/monthly-sports-wagering-revenue-reports/
       operator_aliases:
         DraftKings: draftkings
         DraftKings Sportsbook: draftkings
@@ -51,22 +51,38 @@ sportsbook_records:
         FanDuel Sportsbook: fanduel
         BetMGM: betmgm
         Bet MGM: betmgm
+      report_link_include_keywords:
+      - swrtaxreturns
+      - financials/swrtaxreturns
+      report_link_exclude_keywords:
+      - amendmentslist
+      user_agent_override: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+        (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36
     PA:
       regulator: Pennsylvania Gaming Control Board
       report_index_urls:
-      - https://gamingcontrolboard.pa.gov/?p=financial-reports
+      - https://gamingcontrolboard.pa.gov/news-and-transparency/revenue
       operator_aliases:
         DraftKings: draftkings
         FanDuel: fanduel
         BetMGM: betmgm
+      report_link_include_keywords:
+      - monthly sports wagering report summary
+      report_link_exclude_keywords:
+      - wagering restrictions
+      - fantasy
+      - slots
+      - vgt
     NY:
       regulator: New York State Gaming Commission
-      report_index_urls:
-      - https://gaming.ny.gov/gaming/sportswagering.php
+      report_index_urls: []
       operator_aliases:
         DraftKings: draftkings
         FanDuel: fanduel
         BetMGM: betmgm
+      report_urls:
+      - https://gaming.ny.gov/statewide-sports-wagering-monthly-report-excel
+      - https://gaming.ny.gov/statewide-sports-wagering-monthly-report-pdf
 ux_features:
   platforms:
   - draftkings
