@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -598,6 +599,32 @@ def assert_provenance_populated(df: pd.DataFrame, label: str) -> None:
             raise AssertionError(f"{label} has null/blank values in {col}")
 
 
+def parse_series_bound(value: Any, *, bound: str) -> datetime:
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError(f"prediction_markets.series_{bound} must be a non-empty date")
+
+    if re.fullmatch(r"\d{4}-\d{2}", raw):
+        parsed = pd.to_datetime(f"{raw}-01", utc=True, errors="coerce")
+        if pd.isna(parsed):
+            raise ValueError(f"prediction_markets.series_{bound} must be a valid ISO date")
+        if bound == "start":
+            out = parsed
+        else:
+            out = parsed + pd.offsets.MonthEnd(0)
+            out = out.replace(hour=23, minute=59, second=59, microsecond=0)
+        return out.to_pydatetime()
+
+    parsed = pd.to_datetime(raw, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"prediction_markets.series_{bound} must be a valid ISO date")
+
+    # If caller provided a date without time for the end bound, include the full day.
+    if bound == "end" and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=0)
+    return parsed.to_pydatetime()
+
+
 def load_mode_config(config: Dict[str, Any]) -> Tuple[Dict[str, str], int, int, datetime, datetime]:
     pm_cfg = config["prediction_markets"]
     category_group_map_raw = pm_cfg.get("category_group_map", {})
@@ -608,17 +635,15 @@ def load_mode_config(config: Dict[str, Any]) -> Tuple[Dict[str, str], int, int, 
     snapshot_lookback_days = int(pm_cfg.get("snapshot_lookback_days", 90))
     max_pages = int(pm_cfg.get("max_pages", 25))
 
-    series_start = pd.to_datetime(pm_cfg.get("series_start"), utc=True, errors="coerce")
-    series_end = pd.to_datetime(pm_cfg.get("series_end"), utc=True, errors="coerce")
-    if pd.isna(series_start) or pd.isna(series_end):
-        raise ValueError("prediction_markets.series_start and series_end must be valid ISO dates")
+    series_start = parse_series_bound(pm_cfg.get("series_start"), bound="start")
+    series_end = parse_series_bound(pm_cfg.get("series_end"), bound="end")
 
     return (
         category_group_map,
         snapshot_lookback_days,
         max_pages,
-        series_start.to_pydatetime(),
-        series_end.to_pydatetime(),
+        series_start,
+        series_end,
     )
 
 
