@@ -71,8 +71,16 @@ EXTRA_COLUMNS = [
     "state",
     "month",
     "operator",
+    "licensee",
+    "consumer_brand",
+    "location_type",
     "handle",
     "gross_revenue",
+    "il_state_agr",
+    "il_cook_county_agr",
+    "il_sports_wager_tax",
+    "revenue_native_type",
+    "revenue_comparability_note",
     "promotional_credits",
     "gross_revenue_taxable",
     "pa_operator_total_check_status",
@@ -330,6 +338,200 @@ def parse_ny_statewide_excel(path: str, source_url: str, logger) -> Tuple[List[D
 
     return rows, empty_sheets
 
+
+
+IL_ALLOWED_LOCATION_TYPES = {"In-Person Wagering", "Online Wagering", "Total"}
+
+
+def _read_il_csv_with_metadata(path: str) -> Tuple[pd.DataFrame, Optional[str]]:
+    raw_lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    month = None
+    for line in raw_lines[:5]:
+        month = parse_month_from_text(line)
+        if month:
+            break
+
+    header_idx = None
+    for idx, line in enumerate(raw_lines):
+        lower = line.lower()
+        if "licensee" in lower and "location type" in lower:
+            header_idx = idx
+            break
+    if header_idx is None:
+        raise ValueError(f"il_csv_header_not_found path={path}")
+
+    df = pd.read_csv(path, skiprows=header_idx, dtype=object)
+    df = df[[col for col in df.columns if not str(col).startswith("Unnamed:")]]
+    return df, month
+
+
+def _normalize_il_location_type(raw_location: Any) -> Optional[str]:
+    if raw_location is None:
+        return None
+    text = str(raw_location).strip()
+    if not text:
+        return None
+    normalized = " ".join(text.split())
+    lowered = normalized.lower()
+    if lowered == "online wagering":
+        return "Online Wagering"
+    if lowered == "in-person wagering":
+        return "In-Person Wagering"
+    if lowered == "total":
+        return "Total"
+    return normalized
+
+
+def _parse_il_detail_handles(df: pd.DataFrame) -> Dict[Tuple[str, str], float]:
+    col_map = {canonical_col(str(col)): col for col in df.columns}
+    licensee_col = col_map.get("licensee")
+    location_col = col_map.get("locationtype")
+    tier1_col = col_map.get("tier1handle")
+    tier2_col = col_map.get("tier2handle")
+    sport_level_col = col_map.get("sportlevel")
+
+    if not licensee_col or not location_col or not tier1_col or not tier2_col:
+        raise ValueError("il_detail_missing_required_columns")
+
+    working = df.copy()
+
+    handles_by_key: Dict[Tuple[str, str], float] = {}
+    for _, row in working.iterrows():
+        if sport_level_col:
+            sport_level = str(row.get(sport_level_col, "")).strip().lower()
+            # Keep sport-level detail rows (Professional/College/etc.) and drop embedded summary rows.
+            if sport_level in {"", "total", "online wagering", "in-person wagering"}:
+                continue
+        licensee = str(row.get(licensee_col, "")).strip()
+        if not licensee or "total" in licensee.lower():
+            continue
+
+        location_type = _normalize_il_location_type(row.get(location_col))
+        if location_type is None or location_type not in IL_ALLOWED_LOCATION_TYPES:
+            continue
+
+        tier1 = to_float(row.get(tier1_col)) or 0.0
+        tier2 = to_float(row.get(tier2_col)) or 0.0
+        key = (licensee, location_type)
+        handles_by_key[key] = handles_by_key.get(key, 0.0) + float(tier1 + tier2)
+
+    return handles_by_key
+
+
+def _parse_il_tax_metrics(df: pd.DataFrame) -> Dict[Tuple[str, str], Dict[str, float]]:
+    col_map = {canonical_col(str(col)): col for col in df.columns}
+    licensee_col = col_map.get("licensee")
+    location_col = col_map.get("locationtype")
+    state_agr_col = col_map.get("stateagr")
+    cook_agr_col = col_map.get("cookcountyagr")
+    sports_tax_col = col_map.get("sportswagertax")
+
+    if not licensee_col or not location_col or not state_agr_col:
+        raise ValueError("il_tax_missing_required_columns")
+
+    metrics_by_key: Dict[Tuple[str, str], Dict[str, float]] = {}
+    for _, row in df.iterrows():
+        licensee = str(row.get(licensee_col, "")).strip()
+        if not licensee or "total" in licensee.lower():
+            continue
+
+        location_type = _normalize_il_location_type(row.get(location_col))
+        if location_type is None or location_type not in IL_ALLOWED_LOCATION_TYPES:
+            continue
+
+        state_agr = to_float(row.get(state_agr_col)) or 0.0
+        cook_agr = to_float(row.get(cook_agr_col)) if cook_agr_col else None
+        sports_tax = to_float(row.get(sports_tax_col)) if sports_tax_col else None
+
+        key = (licensee, location_type)
+        current = metrics_by_key.setdefault(
+            key,
+            {"state_agr": 0.0, "cook_county_agr": 0.0, "sports_wager_tax": 0.0},
+        )
+        current["state_agr"] += float(state_agr)
+        if cook_agr is not None:
+            current["cook_county_agr"] += float(cook_agr)
+        if sports_tax is not None:
+            current["sports_wager_tax"] += float(sports_tax)
+
+    return metrics_by_key
+
+
+def parse_il_monthly_csv_pair(
+    detail_csv_path: str,
+    tax_summary_csv_path: str,
+    source_url: str,
+    alias_map: Dict[str, str],
+    logger,
+    forced_month: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
+    detail_df, detail_month = _read_il_csv_with_metadata(detail_csv_path)
+    tax_df, tax_month = _read_il_csv_with_metadata(tax_summary_csv_path)
+
+    month = forced_month or detail_month or tax_month
+    if month is None:
+        return [], "il_missing_month", {}
+
+    detail_handles = _parse_il_detail_handles(detail_df)
+    tax_metrics = _parse_il_tax_metrics(tax_df)
+
+    keys = sorted(set(detail_handles.keys()) | set(tax_metrics.keys()))
+    if not keys:
+        return [], "il_no_operator_rows", {}
+
+    records: List[Dict[str, Any]] = []
+    for licensee, location_type in keys:
+        handle = detail_handles.get((licensee, location_type))
+        tax = tax_metrics.get((licensee, location_type), {})
+        state_agr = tax.get("state_agr")
+        cook_county_agr = tax.get("cook_county_agr")
+        sports_wager_tax = tax.get("sports_wager_tax")
+
+        consumer_brand = normalize_operator(licensee, alias_map) or normalize_operator(licensee, {})
+        if consumer_brand is None:
+            continue
+
+        record = {
+            "platform": consumer_brand,
+            "platform_type": "sportsbook",
+            "metric_date": f"{month}-01",
+            "geography": "IL",
+            "volume": handle,
+            "volume_basis": "monthly_handle",
+            "revenue": state_agr,
+            "liquidity_or_oi": None,
+            "state": "IL",
+            "month": month,
+            "operator": consumer_brand,
+            "licensee": licensee,
+            "consumer_brand": consumer_brand,
+            "location_type": location_type,
+            "handle": handle,
+            "gross_revenue": state_agr,
+            "il_state_agr": state_agr,
+            "il_cook_county_agr": cook_county_agr,
+            "il_sports_wager_tax": sports_wager_tax,
+            "revenue_native_type": "IL_State_AGR",
+            "revenue_comparability_note": "IL uses AGR (State AGR); may not be directly comparable to NY/NJ gross revenue.",
+            "validation_status": "parsed_il_csv_detail_tax",
+        }
+        records.append(add_provenance(record, source_url=source_url))
+
+    diagnostics = {
+        "month": month,
+        "row_count": len(records),
+        "operator_count": len({rec["licensee"] for rec in records}),
+        "location_types": sorted({str(rec.get("location_type")) for rec in records}),
+    }
+    logger.info(
+        "il_parse_summary detail=%s tax=%s month=%s rows=%s operators=%s",
+        detail_csv_path,
+        tax_summary_csv_path,
+        month,
+        diagnostics["row_count"],
+        diagnostics["operator_count"],
+    )
+    return records, "ok", diagnostics
 
 
 def _parse_numeric_candidates(line: str) -> List[float]:

@@ -58,6 +58,27 @@ sportsbook_records:
       - amendmentslist
       user_agent_override: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
         (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36
+    IL:
+      regulator: Illinois Gaming Board
+      report_index_urls:
+      - https://igb.illinois.gov/sports-wagering/sports-reports.html
+      report_endpoint: https://igbapps.illinois.gov/SportsReports_AEM.aspx
+      operator_aliases:
+        815 Entertainment: hard_rock_bet
+        Alton Casino, LLC: argosy_sportsbook
+        Casino Queen, Inc.: draftkings
+        Elgin Riverboat Resort: caesars
+        Fairmount Park, Inc.: fanduel
+        FHR-Illinois  LLC: betrivers
+        Hawthorne Race Course, Inc.: fanatics
+        HC Aurora, LLC: hollywood_aurora_sportsbook
+        HC Joliet, LLC: hollywood_joliet_sportsbook
+        Midwest Gaming & Entertainment, LLC: betrivers
+        Northside Crown Gaming LLC: draftkings_wrigley
+        Par-A-Dice Gaming Corporation: fanduel
+        The Rock Island Boatworks, LLC: rock_island_sportsbook
+        WALKER'S BLUFF CASINO RESORT, LLC: bet365
+        WIND CREEK IL LLC: wind_creek_sportsbook
     NY:
       regulator: New York State Gaming Commission
       report_index_urls: []
