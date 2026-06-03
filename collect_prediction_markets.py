@@ -182,6 +182,10 @@ def resolve_category_group(category: str, category_group_map: Dict[str, str]) ->
     key = canonical_key(category)
     if key in category_group_map:
         return category_group_map[key]
+    # Handle provider category strings that include sports tokens in a larger identifier.
+    for token, group in category_group_map.items():
+        if group == "sports_event" and token and token in key:
+            return "sports_event"
     return "other"
 
 
