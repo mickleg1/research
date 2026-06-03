@@ -187,6 +187,21 @@ def state_raw_dir(state_code: str) -> Path:
     return path
 
 
+def _slugify_for_filename(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower()).strip("_")
+    return slug or "report"
+
+
+def _deterministic_nj_filename(resolved_url: str, ext: str) -> str:
+    parsed = urlparse(resolved_url)
+    stem = Path(parsed.path).stem
+    stem_slug = _slugify_for_filename(stem)
+    month = parse_month_from_text(stem) or parse_month_from_text(parsed.path)
+    if month and "amend" not in stem_slug:
+        return f"nj_{month.replace('-', '_')}.{ext}"
+    return f"nj_{stem_slug}.{ext}"
+
+
 def _layout_path(state_code: str) -> Path:
     return state_raw_dir(state_code) / "_layout_state.json"
 
@@ -419,6 +434,24 @@ def _extract_nj_value_from_row_words(words: List[Dict[str, Any]]) -> Tuple[Optio
     if right_cluster:
         candidate_words = right_cluster
 
+    candidate_words = sorted(candidate_words, key=lambda w: float(w["x0"]))
+    for word in reversed(candidate_words):
+        token = str(word.get("text", "")).strip()
+        value = _parse_numeric_token(token)
+        if value is None:
+            continue
+        if "," in token or token.startswith("(") or abs(value) >= 1000:
+            return value, token
+
+    if len(candidate_words) >= 2:
+        left = str(candidate_words[-2].get("text", "")).strip()
+        right = str(candidate_words[-1].get("text", "")).strip()
+        if re.fullmatch(r"\d", left) and re.fullmatch(r"\(?-?\d{1,3}(?:,\d{3})+(?:\.\d+)?\)?", right):
+            combined = f"{left}{right}"
+            combined_value = _parse_numeric_token(combined)
+            if combined_value is not None:
+                return combined_value, combined
+
     raw_value_token = "".join(str(w.get("text", "")).strip() for w in candidate_words)
     parsed_value = _parse_numeric_token(raw_value_token)
     if parsed_value is None:
@@ -457,7 +490,7 @@ def _is_nj_prior_ytd_row(text: str) -> bool:
     lower = text.lower()
     return (
         "less:" in lower
-        and "last month" in lower
+        and ("last month" in lower or "prior month" in lower)
         and "year-to-date" in lower
         and "online" in lower
         and "gross revenue" in lower
@@ -477,6 +510,14 @@ def _extract_first_value_from_rows(
         if value is not None:
             return value, raw_token, row_text
     return None, None, None
+
+
+def _extract_first_row(rows: List[Dict[str, Any]], *, predicate) -> Optional[Dict[str, Any]]:
+    for row in rows:
+        row_text = str(row.get("text", ""))
+        if predicate(row_text):
+            return row
+    return None
 
 
 def _extract_nj_operator(text: str) -> Optional[str]:
@@ -541,7 +582,58 @@ def _extract_nj_handle_from_rows(rows: List[Dict[str, Any]]) -> Optional[float]:
     return None
 
 
-def parse_nj_monthly_pdf(path: str, source_url: str, logger) -> Tuple[Optional[Dict[str, Any]], str]:
+def _is_nj_block_anchor_row(text: str) -> bool:
+    upper = text.upper()
+    return "MONTHLY SPORTS WAGERING TAX RETURN" in upper or "ONLINE SPORTS WAGERING SKIN DETAIL REPORT" in upper
+
+
+def _extract_nj_operator_for_anchor(rows: List[Dict[str, Any]], anchor_idx: int) -> Optional[str]:
+    for idx in range(anchor_idx - 1, max(-1, anchor_idx - 6), -1):
+        if idx < 0:
+            break
+        candidate = str(rows[idx].get("text", "")).strip()
+        if not candidate:
+            continue
+        upper = candidate.upper()
+        if upper.startswith("FOR THE MONTH OF"):
+            continue
+        if upper.startswith("SPORTS WAGERING"):
+            continue
+        if "DGE-107" in upper:
+            continue
+        if re.fullmatch(r"\d{2}/\d{2}", candidate):
+            continue
+        if candidate.startswith("(") and candidate.endswith(")") and idx - 1 >= 0:
+            primary = str(rows[idx - 1].get("text", "")).strip()
+            if primary:
+                return f"{primary} {candidate}"
+        return candidate
+    return None
+
+
+def _extract_nj_month_from_rows(rows: List[Dict[str, Any]]) -> Optional[str]:
+    for row in rows:
+        month = _extract_nj_month(str(row.get("text", "")))
+        if month:
+            return month
+    return None
+
+
+def _extract_nj_report_type(anchor_text: str) -> str:
+    if "SKIN DETAIL" in anchor_text.upper():
+        return "skin_detail"
+    return "tax_return"
+
+
+def _record_rank_key(record: Dict[str, Any]) -> Tuple[int, int, int]:
+    return (
+        1 if record.get("__report_type") == "tax_return" else 0,
+        1 if record.get("__walkforward_ok") else 0,
+        1 if record.get("handle") is not None else 0,
+    )
+
+
+def parse_nj_monthly_pdf(path: str, source_url: str, logger) -> Tuple[List[Dict[str, Any]], str]:
     with pdfplumber.open(path) as pdf:
         page_texts: List[str] = []
         positioned_rows: List[Dict[str, Any]] = []
@@ -551,61 +643,115 @@ def parse_nj_monthly_pdf(path: str, source_url: str, logger) -> Tuple[Optional[D
 
     full_text = "\n".join(page_texts)
     if not full_text.strip():
-        return None, "empty_text"
+        return [], "empty_text"
 
-    operator = _extract_nj_operator(full_text)
-    month = _extract_nj_month(full_text)
-    gross_revenue, gross_raw_token, gross_row_text = _extract_first_value_from_rows(
-        positioned_rows,
-        predicate=_is_nj_monthly_online_gross_row,
-    )
-    handle = _extract_nj_handle_from_rows(positioned_rows)
-    if handle is None:
-        handle = _extract_nj_handle(full_text)
+    anchor_indices = [idx for idx, row in enumerate(positioned_rows) if _is_nj_block_anchor_row(str(row.get("text", "")))]
+    if not anchor_indices:
+        return [], "no_operator_blocks_found"
 
-    ytd_value, _, _ = _extract_first_value_from_rows(positioned_rows, predicate=_is_nj_ytd_online_gross_row)
-    prior_ytd_value, _, _ = _extract_first_value_from_rows(positioned_rows, predicate=_is_nj_prior_ytd_row)
-    walkforward_ok: Optional[bool] = None
-    if gross_revenue is not None and ytd_value is not None and prior_ytd_value is not None:
-        walkforward_ok = abs((ytd_value - prior_ytd_value) - gross_revenue) <= 1.0
+    fallback_month = _extract_nj_month(full_text)
+    dedup: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-    if not operator:
-        return None, "missing_operator"
-    if not month:
-        return None, "missing_month"
-    if gross_revenue is None:
-        return None, "missing_monthly_online_gross_revenue"
+    for pos, anchor_idx in enumerate(anchor_indices):
+        start_idx = anchor_idx
+        end_idx = anchor_indices[pos + 1] if pos + 1 < len(anchor_indices) else len(positioned_rows)
+        block_rows = positioned_rows[start_idx:end_idx]
+        if not block_rows:
+            continue
 
-    volume = handle if handle is not None else gross_revenue
-    volume_basis = "monthly_handle" if handle is not None else "monthly_revenue"
+        anchor_text = str(block_rows[0].get("text", ""))
+        report_type = _extract_nj_report_type(anchor_text)
+        operator = _extract_nj_operator_for_anchor(positioned_rows, anchor_idx) or _extract_nj_operator(full_text)
+        month = _extract_nj_month_from_rows(block_rows) or fallback_month
 
-    record = {
-        "platform": operator,
-        "platform_type": "sportsbook",
-        "metric_date": f"{month}-01",
-        "geography": "NJ",
-        "volume": volume,
-        "volume_basis": volume_basis,
-        "revenue": gross_revenue,
-        "liquidity_or_oi": None,
-        "state": "NJ",
-        "month": month,
-        "operator": operator,
-        "handle": handle,
-        "gross_revenue": gross_revenue,
-        "validation_status": "parsed_nj_positioned",
-    }
-    if walkforward_ok is not None and not walkforward_ok:
-        logger.warning(
-            "nj_walkforward_failed file=%s monthly=%s ytd=%s prior_ytd=%s row=%s token=%s",
-            path,
-            gross_revenue,
-            ytd_value,
-            prior_ytd_value,
-            gross_row_text,
-            gross_raw_token,
-        )
-    return add_provenance(record, source_url=source_url), "ok"
+        monthly_row = _extract_first_row(block_rows, predicate=_is_nj_monthly_online_gross_row)
+        if monthly_row is None:
+            if report_type == "tax_return":
+                gross_row_text = ""
+                gross_revenue = 0.0
+                gross_raw_token = "-"
+            else:
+                continue
+        else:
+            gross_row_text = str(monthly_row.get("text", ""))
+            gross_revenue, gross_raw_token = _extract_nj_value_from_row_words(monthly_row.get("words", []))
+            if gross_revenue is None and re.search(r"(^|\s)-(\s|$)", gross_row_text):
+                gross_revenue = 0.0
+                gross_raw_token = "-"
+            if gross_revenue is None:
+                continue
+
+        handle = _extract_nj_handle_from_rows(block_rows)
+        if handle is None:
+            handle = _extract_nj_handle("\n".join(str(r.get("text", "")) for r in block_rows))
+
+        ytd_row = _extract_first_row(block_rows, predicate=_is_nj_ytd_online_gross_row)
+        prior_row = _extract_first_row(block_rows, predicate=_is_nj_prior_ytd_row)
+        ytd_value: Optional[float] = None
+        prior_ytd_value: Optional[float] = None
+        if ytd_row is not None:
+            ytd_value, _ = _extract_nj_value_from_row_words(ytd_row.get("words", []))
+            if ytd_value is None and re.search(r"(^|\s)-(\s|$)", str(ytd_row.get("text", ""))):
+                ytd_value = 0.0
+        if prior_row is not None:
+            prior_ytd_value, _ = _extract_nj_value_from_row_words(prior_row.get("words", []))
+            if prior_ytd_value is None and re.search(r"(^|\s)-(\s|$)", str(prior_row.get("text", ""))):
+                prior_ytd_value = 0.0
+
+        walkforward_ok = False
+        if ytd_value is not None and prior_ytd_value is not None:
+            walkforward_ok = abs((ytd_value - prior_ytd_value) - gross_revenue) <= 1.0
+            if not walkforward_ok:
+                logger.warning(
+                    "nj_walkforward_failed file=%s operator=%s month=%s monthly=%s ytd=%s prior_ytd=%s row=%s token=%s",
+                    path,
+                    operator,
+                    month,
+                    gross_revenue,
+                    ytd_value,
+                    prior_ytd_value,
+                    gross_row_text,
+                    gross_raw_token,
+                )
+
+        if not operator or not month:
+            continue
+
+        volume = handle if handle is not None else gross_revenue
+        volume_basis = "monthly_handle" if handle is not None else "monthly_revenue"
+        record = {
+            "platform": operator,
+            "platform_type": "sportsbook",
+            "metric_date": f"{month}-01",
+            "geography": "NJ",
+            "volume": volume,
+            "volume_basis": volume_basis,
+            "revenue": gross_revenue,
+            "liquidity_or_oi": None,
+            "state": "NJ",
+            "month": month,
+            "operator": operator,
+            "handle": handle,
+            "gross_revenue": gross_revenue,
+            "validation_status": "parsed_nj_positioned",
+            "__report_type": report_type,
+            "__walkforward_ok": walkforward_ok,
+        }
+
+        key = (operator, month)
+        existing = dedup.get(key)
+        if existing is None or _record_rank_key(record) > _record_rank_key(existing):
+            dedup[key] = record
+
+    if not dedup:
+        return [], "missing_monthly_online_gross_revenue"
+
+    final_records: List[Dict[str, Any]] = []
+    for record in dedup.values():
+        record.pop("__report_type", None)
+        record.pop("__walkforward_ok", None)
+        final_records.append(add_provenance(record, source_url=source_url))
+    return final_records, "ok"
 
 
 
@@ -869,12 +1015,19 @@ def collect_state_reports(
             logger.info("skip_non_report_file state=%s requested=%s resolved=%s", state_code, link, result.url)
             continue
 
-        raw_path = save_raw_bytes(
-            source=f"{state_code.lower()}_{ext}",
-            ext=ext,
-            content=result.body,
-            subdir=str(state_raw_dir(state_code)),
-        )
+        raw_dir = state_raw_dir(state_code)
+        if state_code == "NJ":
+            deterministic_name = _deterministic_nj_filename(result.url, ext)
+            raw_file = raw_dir / deterministic_name
+            raw_file.write_bytes(result.body)
+            raw_path = str(raw_file)
+        else:
+            raw_path = save_raw_bytes(
+                source=f"{state_code.lower()}_{ext}",
+                ext=ext,
+                content=result.body,
+                subdir=str(raw_dir),
+            )
 
         month = (
             parse_month_from_text(Path(final_parsed.path).name)
@@ -913,16 +1066,16 @@ def collect_state_reports(
 
         elif state_code == "NJ" and ext == "pdf":
             try:
-                nj_row, reason = parse_nj_monthly_pdf(raw_path, source_url=result.url, logger=logger)
+                nj_rows, reason = parse_nj_monthly_pdf(raw_path, source_url=result.url, logger=logger)
             except Exception as exc:
                 logger.warning("parse_failed state=%s file=%s err=%s", state_code, raw_path, exc)
                 move_to_needs_review(raw_path, reason=f"parse_failed:{exc}", logger=logger)
                 continue
 
-            if nj_row is not None:
+            if nj_rows:
                 parsed_any = True
-                records.append(nj_row)
-                layout_state["last_successful_fingerprint"] = "nj_text_monthly_online_gross_revenue"
+                records.extend(nj_rows)
+                layout_state["last_successful_fingerprint"] = "nj_positioned_multi_operator_blocks"
                 layout_state["last_successful_source"] = result.url
             else:
                 logger.warning("nj_text_parse_failed file=%s reason=%s", raw_path, reason)
