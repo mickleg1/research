@@ -343,15 +343,18 @@ def fetch_kalshi_rows(
     page_total = 0
     market_total = 0
     sports_series_tickers: Optional[List[str]] = None
+    sports_series_lookup: set[str] = set()
+
+    if mode in {"monthly", "snapshot"}:
+        sports_series_tickers = discover_kalshi_sports_series_tickers(
+            client,
+            base,
+            logger,
+        )
+        sports_series_lookup = set(sports_series_tickers)
 
     for status in statuses:
         if status == "settled" and mode == "monthly":
-            if sports_series_tickers is None:
-                sports_series_tickers = discover_kalshi_sports_series_tickers(
-                    client,
-                    base,
-                    logger,
-                )
             series_scope: List[Optional[str]] = sports_series_tickers or [None]
         else:
             series_scope = [None]
@@ -405,6 +408,13 @@ def fetch_kalshi_rows(
                     if mode == "monthly" and status == "settled" and series_ticker:
                         # Settled markets are fetched from sports-only series in monthly mode.
                         row["category_group"] = "sports_event"
+                    elif mode == "snapshot" and sports_series_lookup:
+                        event_ticker = str(
+                            first_of(market, ["event_ticker", "eventTicker", "series_ticker", "seriesTicker"], "")
+                        ).strip()
+                        series_ticker_guess = event_ticker.split("-")[0] if event_ticker else ""
+                        if series_ticker_guess and series_ticker_guess in sports_series_lookup:
+                            row["category_group"] = "sports_event"
                     row["__market_ts"] = market_ts
                     rows.append(row)
 
