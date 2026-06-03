@@ -285,6 +285,9 @@ def discover_kalshi_sports_series_tickers(
     client: PoliteClient,
     base_url: str,
     logger,
+    *,
+    settled_start: Optional[datetime],
+    settled_end: Optional[datetime],
 ) -> List[str]:
     tickers: List[str] = []
     cursor: Optional[str] = None
@@ -309,6 +312,11 @@ def discover_kalshi_sports_series_tickers(
             ticker = str(item.get("ticker") or "").strip()
             category = str(item.get("category") or "").strip().lower()
             if not ticker or category != "sports":
+                continue
+            updated_ts = parse_market_timestamp(item.get("last_updated_ts"))
+            if settled_start and (updated_ts is None or updated_ts < settled_start):
+                continue
+            if settled_end and (updated_ts is None or updated_ts > settled_end):
                 continue
             tickers.append(ticker)
 
@@ -346,7 +354,13 @@ def fetch_kalshi_rows(
     for status in statuses:
         if status == "settled" and mode == "monthly":
             if sports_series_tickers is None:
-                sports_series_tickers = discover_kalshi_sports_series_tickers(client, base, logger)
+                sports_series_tickers = discover_kalshi_sports_series_tickers(
+                    client,
+                    base,
+                    logger,
+                    settled_start=settled_start,
+                    settled_end=settled_end,
+                )
             series_scope: List[Optional[str]] = sports_series_tickers or [None]
         else:
             series_scope = [None]
