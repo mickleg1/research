@@ -954,7 +954,7 @@ def _parse_pa_numeric_token(token: str) -> Optional[float]:
     if not cleaned:
         return None
     if cleaned in {"-", "--", "—", "–"}:
-        return 0.0
+        return None
     if "%" in cleaned:
         return None
     if not re.search(r"\d", cleaned):
@@ -964,11 +964,22 @@ def _parse_pa_numeric_token(token: str) -> Optional[float]:
         normalized = f"-{normalized[1:-1]}"
     normalized = normalized.strip()
     if normalized in {"", "-"}:
-        return 0.0
+        return None
     try:
         return float(normalized)
     except ValueError:
         return None
+
+
+def _is_pa_numeric_only_row(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if not re.search(r"\d", stripped):
+        return False
+    if re.search(r"[A-Za-z]", stripped):
+        return False
+    return True
 
 
 def _assign_pa_words_to_bins(
@@ -1098,7 +1109,12 @@ def _extract_pa_metric_values_for_operator(
             }
             continue
         end = min((idx for key, idx in anchor_idx.items() if idx > start), default=len(section_rows))
-        metric_rows = section_rows[start:end]
+        metric_start = start
+        if start - 1 >= 0:
+            prev_text = str(section_rows[start - 1].get("text", ""))
+            if _is_pa_numeric_only_row(prev_text):
+                metric_start = start - 1
+        metric_rows = section_rows[metric_start:end]
         words: List[Dict[str, Any]] = []
         for row in metric_rows:
             words.extend(row.get("words", []))
