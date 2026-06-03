@@ -58,21 +58,6 @@ sportsbook_records:
       - amendmentslist
       user_agent_override: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
         (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36
-    PA:
-      regulator: Pennsylvania Gaming Control Board
-      report_index_urls:
-      - https://gamingcontrolboard.pa.gov/news-and-transparency/revenue
-      operator_aliases:
-        DraftKings: draftkings
-        FanDuel: fanduel
-        BetMGM: betmgm
-      report_link_include_keywords:
-      - monthly sports wagering report summary
-      report_link_exclude_keywords:
-      - wagering restrictions
-      - fantasy
-      - slots
-      - vgt
     NY:
       regulator: New York State Gaming Commission
       report_index_urls: []
