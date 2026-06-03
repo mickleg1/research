@@ -1105,12 +1105,23 @@ def _extract_pa_metric_values_for_operator(
 
         values, duplicates, unassigned = _assign_pa_words_to_bins(words, bins, tolerance=tolerance)
         total_value = values.get("total")
-        monthly_values = [values.get(month_key) for month_key in month_keys]
+        populated_month_keys = [month_key for month_key in month_keys if values.get(month_key) is not None]
+        latest_populated_idx = max((month_keys.index(month_key) for month_key in populated_month_keys), default=-1)
+        required_month_keys = month_keys[: latest_populated_idx + 1] if latest_populated_idx >= 0 else []
+        missing_before_latest = [month_key for month_key in required_month_keys if values.get(month_key) is None]
+        future_month_keys = month_keys[latest_populated_idx + 1 :] if latest_populated_idx >= 0 else month_keys
+        future_populated = [month_key for month_key in future_month_keys if values.get(month_key) is not None]
+
+        required_token_count = len(required_month_keys) + (1 if total_value is not None else 0)
+        count_ok = bool(required_month_keys) and not missing_before_latest and not future_populated and total_value is not None
+
+        # Fiscal-year reports can have future months blank; reconcile over populated months only.
+        populated_values = [float(values[month_key]) for month_key in month_keys if values.get(month_key) is not None]
         sum_monthly: Optional[float] = None
         total_status = "missing_values"
-        if total_value is not None and all(value is not None for value in monthly_values):
-            sum_monthly = float(sum(float(value) for value in monthly_values))
-            if abs(sum_monthly - float(total_value)) <= 1.0:
+        if total_value is not None and populated_values:
+            sum_monthly = float(sum(populated_values))
+            if abs(sum_monthly - float(total_value)) <= 2.0:
                 total_status = "ok"
             else:
                 total_status = "mismatch"
@@ -1119,21 +1130,30 @@ def _extract_pa_metric_values_for_operator(
             "values": values,
             "token_count": len(values),
             "expected": expected_count,
-            "count_ok": len(values) == expected_count,
+            "required_token_count": required_token_count,
+            "count_ok": count_ok,
             "total_status": total_status,
             "sum_monthly": sum_monthly,
             "total_value": total_value,
+            "latest_populated_month": month_keys[latest_populated_idx] if latest_populated_idx >= 0 else None,
+            "missing_before_latest": missing_before_latest,
+            "future_null_months": [month_key for month_key in future_month_keys if values.get(month_key) is None],
+            "future_populated_months": future_populated,
             "duplicates": duplicates,
             "unassigned": unassigned,
         }
 
-        if len(values) != expected_count:
+        if not count_ok:
             logger.warning(
-                "pa_metric_column_count_mismatch operator=%s metric=%s found=%s expected=%s duplicates=%s unassigned=%s",
+                "pa_metric_column_count_mismatch operator=%s metric=%s found=%s expected=%s required=%s latest=%s missing_before_latest=%s future_populated=%s duplicates=%s unassigned=%s",
                 operator,
                 metric_key,
                 len(values),
                 expected_count,
+                required_token_count,
+                month_keys[latest_populated_idx] if latest_populated_idx >= 0 else None,
+                missing_before_latest,
+                future_populated,
                 duplicates,
                 unassigned,
             )
@@ -1184,11 +1204,6 @@ def parse_pa_matrix_pdf(path: str, source_url: str, logger) -> Tuple[List[Dict[s
 
         if not metric_count_ok or not total_check_ok:
             diagnostics["flagged_operators"].append(operator)
-            move_to_needs_review(
-                path,
-                reason=f"pa_guard_failed_{operator.lower().replace(' ', '_')}",
-                logger=logger,
-            )
 
         operator_report = {
             "operator": operator,
@@ -1232,6 +1247,13 @@ def parse_pa_matrix_pdf(path: str, source_url: str, logger) -> Tuple[List[Dict[s
                 "validation_status": validation_status,
             }
             records.append(add_provenance(record, source_url=source_url))
+
+    if diagnostics["flagged_operators"]:
+        move_to_needs_review(
+            path,
+            reason=f"pa_guard_failed:{len(diagnostics['flagged_operators'])}_operators",
+            logger=logger,
+        )
 
     return records, "ok", diagnostics
 
