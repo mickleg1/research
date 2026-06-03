@@ -465,7 +465,7 @@ def _is_nj_monthly_online_gross_row(text: str) -> bool:
     lower = text.lower()
     return (
         "monthly" in lower
-        and "online" in lower
+        and ("online" in lower or "internet" in lower)
         and "gross revenue" in lower
         and ("sports wagering" in lower or "sportsbook" in lower)
         and "year-to-date" not in lower
@@ -479,7 +479,7 @@ def _is_nj_ytd_online_gross_row(text: str) -> bool:
     lower = text.lower()
     return (
         "year-to-date" in lower
-        and "online" in lower
+        and ("online" in lower or "internet" in lower)
         and "gross revenue" in lower
         and ("sports wagering" in lower or "sportsbook" in lower)
         and "less:" not in lower
@@ -492,7 +492,7 @@ def _is_nj_prior_ytd_row(text: str) -> bool:
         "less:" in lower
         and ("last month" in lower or "prior month" in lower)
         and "year-to-date" in lower
-        and "online" in lower
+        and ("online" in lower or "internet" in lower)
         and "gross revenue" in lower
     )
 
