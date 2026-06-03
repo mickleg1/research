@@ -337,6 +337,148 @@ def _parse_numeric_candidates(line: str) -> List[float]:
     return candidates
 
 
+def _parse_numeric_token(raw_token: str) -> Optional[float]:
+    raw = raw_token.strip()
+    if not raw:
+        return None
+    cleaned = raw.replace("$", "").replace(",", "").replace(" ", "")
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        cleaned = "-" + cleaned[1:-1]
+    if cleaned in {"", "-"}:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _extract_positioned_rows_from_page(page: Any, page_index: int) -> List[Dict[str, Any]]:
+    words = page.extract_words(
+        keep_blank_chars=False,
+        use_text_flow=True,
+        x_tolerance=2,
+        y_tolerance=2,
+    )
+    buckets: Dict[float, List[Dict[str, Any]]] = {}
+    for word in words:
+        y_center = round((float(word["top"]) + float(word["bottom"])) / 2.0, 1)
+        buckets.setdefault(y_center, []).append(word)
+
+    rows: List[Dict[str, Any]] = []
+    for y_center, row_words in buckets.items():
+        ordered = sorted(row_words, key=lambda w: float(w["x0"]))
+        row_text = " ".join(str(w.get("text", "")).strip() for w in ordered).strip()
+        if not row_text:
+            continue
+        rows.append(
+            {
+                "page_index": page_index,
+                "y_center": y_center,
+                "text": row_text,
+                "words": ordered,
+            }
+        )
+    rows.sort(key=lambda r: (int(r["page_index"]), float(r["y_center"])))
+    return rows
+
+
+def _extract_nj_value_from_row_words(words: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[str]]:
+    ordered = sorted(words, key=lambda w: float(w["x0"]))
+    label_end_x = 0.0
+    for word in ordered:
+        text = str(word.get("text", "")).strip().lower().rstrip(":")
+        if text in {"gross", "revenue", "handle", "wagered", "accepted"}:
+            label_end_x = max(label_end_x, float(word["x1"]))
+
+    candidate_words: List[Dict[str, Any]] = []
+    for word in ordered:
+        token = str(word.get("text", "")).strip()
+        if not token:
+            continue
+        if float(word["x0"]) <= label_end_x + 4:
+            continue
+        if not re.search(r"[\d(),.$-]", token):
+            continue
+        candidate_words.append(word)
+
+    if not candidate_words:
+        for word in ordered:
+            token = str(word.get("text", "")).strip()
+            if not re.search(r"[\d(),.$-]", token):
+                continue
+            if re.fullmatch(r"\d+", token) and float(token) < 100 and float(word["x0"]) < 150:
+                continue
+            candidate_words.append(word)
+
+    if not candidate_words:
+        return None, None
+
+    candidate_words = sorted(candidate_words, key=lambda w: float(w["x0"]))
+    rightmost_x = max(float(w["x1"]) for w in candidate_words)
+    right_cluster = [w for w in candidate_words if float(w["x0"]) >= (rightmost_x - 120.0)]
+    if right_cluster:
+        candidate_words = right_cluster
+
+    raw_value_token = "".join(str(w.get("text", "")).strip() for w in candidate_words)
+    parsed_value = _parse_numeric_token(raw_value_token)
+    if parsed_value is None:
+        fallback = _parse_numeric_candidates(" ".join(str(w.get("text", "")) for w in candidate_words))
+        if fallback:
+            return fallback[-1], raw_value_token
+    return parsed_value, raw_value_token
+
+
+def _is_nj_monthly_online_gross_row(text: str) -> bool:
+    lower = text.lower()
+    return (
+        "monthly" in lower
+        and "online" in lower
+        and "gross revenue" in lower
+        and ("sports wagering" in lower or "sportsbook" in lower)
+        and "year-to-date" not in lower
+        and "taxable" not in lower
+        and "tax on" not in lower
+        and "less:" not in lower
+    )
+
+
+def _is_nj_ytd_online_gross_row(text: str) -> bool:
+    lower = text.lower()
+    return (
+        "year-to-date" in lower
+        and "online" in lower
+        and "gross revenue" in lower
+        and ("sports wagering" in lower or "sportsbook" in lower)
+        and "less:" not in lower
+    )
+
+
+def _is_nj_prior_ytd_row(text: str) -> bool:
+    lower = text.lower()
+    return (
+        "less:" in lower
+        and "last month" in lower
+        and "year-to-date" in lower
+        and "online" in lower
+        and "gross revenue" in lower
+    )
+
+
+def _extract_first_value_from_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    predicate,
+) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    for row in rows:
+        row_text = str(row.get("text", ""))
+        if not predicate(row_text):
+            continue
+        value, raw_token = _extract_nj_value_from_row_words(row.get("words", []))
+        if value is not None:
+            return value, raw_token, row_text
+    return None, None, None
+
+
 def _extract_nj_operator(text: str) -> Optional[str]:
     match = re.search(
         r"^\s*([A-Z0-9&.,'/ -]+?)\s*\n\s*(?:MONTHLY SPORTS WAGERING TAX RETURN|ONLINE SPORTS WAGERING SKIN DETAIL REPORT)",
@@ -365,31 +507,6 @@ def _extract_nj_month(text: str) -> Optional[str]:
     return f"{year}-{month_num}"
 
 
-def _extract_nj_gross_revenue(text: str) -> Optional[float]:
-    lines = text.splitlines()
-    priorities = [
-        "monthly online sports wagering gross revenue",
-        "monthly online sportsbook gross revenue",
-        "monthly online sports wagering gross",
-    ]
-
-    for needle in priorities:
-        for line in lines:
-            if needle in line.lower():
-                values = _parse_numeric_candidates(line)
-                if values:
-                    return values[0]
-
-    for line in lines:
-        lower = line.lower()
-        if "monthly" in lower and "gross revenue" in lower and "online" in lower:
-            values = _parse_numeric_candidates(line)
-            if values:
-                return values[0]
-
-    return None
-
-
 def _extract_nj_handle(text: str) -> Optional[float]:
     handle_needles = [
         "total handle",
@@ -406,11 +523,31 @@ def _extract_nj_handle(text: str) -> Optional[float]:
     return None
 
 
+def _extract_nj_handle_from_rows(rows: List[Dict[str, Any]]) -> Optional[float]:
+    handle_needles = [
+        "total handle",
+        "amount wagered",
+        "sports wagering handle",
+        "wagers accepted",
+    ]
+    for row in rows:
+        row_text = str(row.get("text", ""))
+        lower = row_text.lower()
+        if not any(needle in lower for needle in handle_needles):
+            continue
+        value, _ = _extract_nj_value_from_row_words(row.get("words", []))
+        if value is not None:
+            return value
+    return None
+
+
 def parse_nj_monthly_pdf(path: str, source_url: str, logger) -> Tuple[Optional[Dict[str, Any]], str]:
     with pdfplumber.open(path) as pdf:
         page_texts: List[str] = []
+        positioned_rows: List[Dict[str, Any]] = []
         for page in pdf.pages:
             page_texts.append(page.extract_text() or "")
+            positioned_rows.extend(_extract_positioned_rows_from_page(page, page.page_number - 1))
 
     full_text = "\n".join(page_texts)
     if not full_text.strip():
@@ -418,8 +555,19 @@ def parse_nj_monthly_pdf(path: str, source_url: str, logger) -> Tuple[Optional[D
 
     operator = _extract_nj_operator(full_text)
     month = _extract_nj_month(full_text)
-    gross_revenue = _extract_nj_gross_revenue(full_text)
-    handle = _extract_nj_handle(full_text)
+    gross_revenue, gross_raw_token, gross_row_text = _extract_first_value_from_rows(
+        positioned_rows,
+        predicate=_is_nj_monthly_online_gross_row,
+    )
+    handle = _extract_nj_handle_from_rows(positioned_rows)
+    if handle is None:
+        handle = _extract_nj_handle(full_text)
+
+    ytd_value, _, _ = _extract_first_value_from_rows(positioned_rows, predicate=_is_nj_ytd_online_gross_row)
+    prior_ytd_value, _, _ = _extract_first_value_from_rows(positioned_rows, predicate=_is_nj_prior_ytd_row)
+    walkforward_ok: Optional[bool] = None
+    if gross_revenue is not None and ytd_value is not None and prior_ytd_value is not None:
+        walkforward_ok = abs((ytd_value - prior_ytd_value) - gross_revenue) <= 1.0
 
     if not operator:
         return None, "missing_operator"
@@ -445,9 +593,20 @@ def parse_nj_monthly_pdf(path: str, source_url: str, logger) -> Tuple[Optional[D
         "operator": operator,
         "handle": handle,
         "gross_revenue": gross_revenue,
-        "validation_status": "parsed_nj_text",
+        "validation_status": "parsed_nj_positioned",
     }
+    if walkforward_ok is not None and not walkforward_ok:
+        logger.warning(
+            "nj_walkforward_failed file=%s monthly=%s ytd=%s prior_ytd=%s row=%s token=%s",
+            path,
+            gross_revenue,
+            ytd_value,
+            prior_ytd_value,
+            gross_row_text,
+            gross_raw_token,
+        )
     return add_provenance(record, source_url=source_url), "ok"
+
 
 
 def dataframe_views(df: pd.DataFrame) -> List[pd.DataFrame]:
