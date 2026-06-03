@@ -409,6 +409,9 @@ def fetch_kalshi_rows(
                         category_group_map=category_group_map,
                         status_override=status,
                     )
+                    if mode == "monthly" and status == "settled" and series_ticker:
+                        # Settled markets are fetched from sports-only series in monthly mode.
+                        row["category_group"] = "sports_event"
                     row["__market_ts"] = market_ts
                     rows.append(row)
 
