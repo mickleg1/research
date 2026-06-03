@@ -281,6 +281,47 @@ def _filter_window(ts: Optional[datetime], start_dt: Optional[datetime], end_dt:
     return True
 
 
+def discover_kalshi_sports_series_tickers(
+    client: PoliteClient,
+    base_url: str,
+    logger,
+) -> List[str]:
+    tickers: List[str] = []
+    cursor: Optional[str] = None
+    page_num = 1
+
+    while True:
+        params: Dict[str, Any] = {"limit": 5000}
+        if cursor:
+            params["cursor"] = cursor
+
+        response = client.get(url=f"{base_url}/series", params=params, use_cache=True, robots_required=False)
+        payload = json.loads(response.body.decode("utf-8"))
+        save_raw_json(source=f"kalshi_series_sports_p{page_num}", payload=payload)
+
+        series = payload.get("series", []) if isinstance(payload, dict) else []
+        if not isinstance(series, list):
+            series = []
+
+        for item in series:
+            if not isinstance(item, dict):
+                continue
+            ticker = str(item.get("ticker") or "").strip()
+            category = str(item.get("category") or "").strip().lower()
+            if not ticker or category != "sports":
+                continue
+            tickers.append(ticker)
+
+        cursor = str(payload.get("cursor") or "") if isinstance(payload, dict) else ""
+        if not cursor:
+            break
+        page_num += 1
+
+    unique = sorted(set(tickers))
+    logger.info("kalshi sports series discovered=%s", len(unique))
+    return unique
+
+
 def fetch_kalshi_rows(
     client: PoliteClient,
     cfg: Dict[str, Any],
@@ -300,74 +341,88 @@ def fetch_kalshi_rows(
     rows: List[Dict[str, Any]] = []
     page_total = 0
     market_total = 0
+    sports_series_tickers: Optional[List[str]] = None
 
     for status in statuses:
-        cursor: Optional[str] = None
-        page_num = 1
-        while True:
-            check_page_cap(page_num, max_pages, f"kalshi:{status}:{mode}")
-            params = dict(base_params)
-            params["status"] = status
-            if cursor:
-                params["cursor"] = cursor
+        if status == "settled" and mode == "monthly":
+            if sports_series_tickers is None:
+                sports_series_tickers = discover_kalshi_sports_series_tickers(client, base, logger)
+            series_scope: List[Optional[str]] = sports_series_tickers or [None]
+        else:
+            series_scope = [None]
 
-            response = client.get(url=f"{base}{endpoint}", params=params, use_cache=True, robots_required=False)
-            payload = json.loads(response.body.decode("utf-8"))
-            save_raw_json(source=f"kalshi_{mode}_{status}_p{page_num}", payload=payload)
+        for series_ticker in series_scope:
+            cursor: Optional[str] = None
+            page_num = 1
+            while True:
+                context = f"kalshi:{status}:{mode}" if series_ticker is None else f"kalshi:{status}:{mode}:{series_ticker}"
+                check_page_cap(page_num, max_pages, context)
 
-            markets, next_cursor = _extract_kalshi_page(payload)
-            page_total += 1
-            market_total += len(markets)
-            logger.info(
-                "kalshi mode=%s status=%s page=%s rows=%s url=%s http=%s",
-                mode,
-                status,
-                page_num,
-                len(markets),
-                response.url,
-                response.status_code,
-            )
+                params = dict(base_params)
+                params["status"] = status
+                if series_ticker:
+                    params["series_ticker"] = series_ticker
+                if cursor:
+                    params["cursor"] = cursor
 
-            for market in markets:
-                market_ts = extract_market_datetime(market)
-                if status == "settled" and not _filter_window(market_ts, settled_start, settled_end):
-                    continue
-                row = normalize_snapshot_row(
-                    platform="kalshi",
-                    market=market,
-                    source_url=response.url,
-                    category_group_map=category_group_map,
-                    status_override=status,
-                )
-                row["__market_ts"] = market_ts
-                rows.append(row)
+                response = client.get(url=f"{base}{endpoint}", params=params, use_cache=True, robots_required=False)
+                payload = json.loads(response.body.decode("utf-8"))
+                series_suffix = "" if not series_ticker else f"_{series_ticker.lower()}"
+                save_raw_json(source=f"kalshi_{mode}_{status}{series_suffix}_p{page_num}", payload=payload)
 
-            if status == "open":
-                # Current-open collection is a single pass in both modes.
-                if next_cursor:
-                    logger.info("kalshi mode=%s status=open single-pass stop after page=%s", mode, page_num)
-                break
-
-            if status == "settled" and mode == "snapshot":
-                # Structural snapshot mode is explicitly single-pass.
-                if next_cursor:
-                    logger.info("kalshi mode=%s status=settled single-pass stop after page=%s", mode, page_num)
-                break
-
-            if status == "settled" and settled_start and should_stop_settled_pagination(markets, settled_start):
+                markets, next_cursor = _extract_kalshi_page(payload)
+                page_total += 1
+                market_total += len(markets)
                 logger.info(
-                    "kalshi mode=%s status=settled stop_at_window page=%s lower_bound=%s",
+                    "kalshi mode=%s status=%s series=%s page=%s rows=%s url=%s http=%s",
                     mode,
+                    status,
+                    series_ticker,
                     page_num,
-                    settled_start.isoformat(),
+                    len(markets),
+                    response.url,
+                    response.status_code,
                 )
-                break
 
-            if not next_cursor:
-                break
+                for market in markets:
+                    market_ts = extract_market_datetime(market)
+                    if status == "settled" and not _filter_window(market_ts, settled_start, settled_end):
+                        continue
+                    row = normalize_snapshot_row(
+                        platform="kalshi",
+                        market=market,
+                        source_url=response.url,
+                        category_group_map=category_group_map,
+                        status_override=status,
+                    )
+                    row["__market_ts"] = market_ts
+                    rows.append(row)
 
-            cursor = next_cursor
-            page_num += 1
+                if status == "open":
+                    if next_cursor:
+                        logger.info("kalshi mode=%s status=open single-pass stop after page=%s", mode, page_num)
+                    break
+
+                if status == "settled" and mode == "snapshot":
+                    if next_cursor:
+                        logger.info("kalshi mode=%s status=settled single-pass stop after page=%s", mode, page_num)
+                    break
+
+                if status == "settled" and settled_start and should_stop_settled_pagination(markets, settled_start):
+                    logger.info(
+                        "kalshi mode=%s status=settled series=%s stop_at_window page=%s lower_bound=%s",
+                        mode,
+                        series_ticker,
+                        page_num,
+                        settled_start.isoformat(),
+                    )
+                    break
+
+                if not next_cursor:
+                    break
+
+                cursor = next_cursor
+                page_num += 1
 
     logger.info("kalshi mode=%s pages=%s markets_seen=%s rows_kept=%s", mode, page_total, market_total, len(rows))
     return rows, {"pages": page_total, "markets_seen": market_total, "rows_kept": len(rows)}
