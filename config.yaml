@@ -1,0 +1,119 @@
+contact_email: research@example.edu
+user_agent: 'sportsbook-prediction-market-collector/1.0 (contact: research@example.edu)'
+request_rate_limit_per_sec: 1.0
+request_timeout_sec: 30
+prediction_markets:
+  kalshi:
+    base_url: https://external-api.kalshi.com/trade-api/v2
+    markets_endpoint: /markets
+    default_params:
+      limit: 500
+  polymarket:
+    gamma_base_url: https://gamma-api.polymarket.com
+    data_base_url: https://data-api.polymarket.com
+    markets_endpoint: /markets/keyset
+    default_params:
+      limit: 100
+  snapshot_lookback_days: 90
+  max_pages: 200
+  series_start: '2022-01'
+  series_end: '2026-03'
+  category_group_map:
+    sports: sports_event
+    sport: sports_event
+    sports_event: sports_event
+    nfl: sports_event
+    nba: sports_event
+    mlb: sports_event
+    nhl: sports_event
+    soccer: sports_event
+    tennis: sports_event
+    golf: sports_event
+    mma: sports_event
+    boxing: sports_event
+    esports: sports_event
+    politics: other
+    economics: other
+    crypto: other
+    weather: other
+    other: other
+sportsbook_records:
+  states:
+    NJ:
+      regulator: New Jersey Division of Gaming Enforcement
+      report_index_urls:
+      - https://www.njoag.gov/about/divisions-and-offices/division-of-gaming-enforcement-home/financial-and-statistical-information/monthly-sports-wagering-revenue-reports/
+      operator_aliases:
+        DraftKings: draftkings
+        DraftKings Sportsbook: draftkings
+        DK: draftkings
+        FanDuel: fanduel
+        FanDuel Sportsbook: fanduel
+        BetMGM: betmgm
+        Bet MGM: betmgm
+      report_link_include_keywords:
+      - swrtaxreturns
+      - financials/swrtaxreturns
+      report_link_exclude_keywords:
+      - amendmentslist
+      user_agent_override: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+        (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36
+    IL:
+      regulator: Illinois Gaming Board
+      report_index_urls:
+      - https://igb.illinois.gov/sports-wagering/sports-reports.html
+      report_endpoint: https://igbapps.illinois.gov/SportsReports_AEM.aspx
+      operator_aliases:
+        815 Entertainment: hard_rock_bet
+        Alton Casino, LLC: argosy_sportsbook
+        Casino Queen, Inc.: draftkings
+        Elgin Riverboat Resort: caesars
+        Fairmount Park, Inc.: fanduel
+        FHR-Illinois  LLC: betrivers
+        Hawthorne Race Course, Inc.: fanatics
+        HC Aurora, LLC: hollywood_aurora_sportsbook
+        HC Joliet, LLC: hollywood_joliet_sportsbook
+        Midwest Gaming & Entertainment, LLC: betrivers
+        Northside Crown Gaming LLC: draftkings
+        Par-A-Dice Gaming Corporation: fanduel
+        Southern Illinois Riverboat/Casino Cruises LLC: draftkings
+        The Rock Island Boatworks, LLC: rock_island_sportsbook
+        WALKER'S BLUFF CASINO RESORT, LLC: bet365
+        WIND CREEK IL LLC: wind_creek_sportsbook
+    NY:
+      regulator: New York State Gaming Commission
+      report_index_urls: []
+      operator_aliases:
+        DraftKings: draftkings
+        FanDuel: fanduel
+        BetMGM: betmgm
+      report_urls:
+      - https://gaming.ny.gov/statewide-sports-wagering-monthly-report-excel
+      - https://gaming.ny.gov/statewide-sports-wagering-monthly-report-pdf
+ux_features:
+  platforms:
+  - draftkings
+  - fanduel
+  - kalshi
+  - polymarket
+  source_pages:
+    draftkings:
+    - https://sportsbook.draftkings.com/
+    - https://www.draftkings.com/sportsbook
+    - https://apps.apple.com/us/app/draftkings-sportsbook-casino/id1131399201
+    - https://play.google.com/store/apps/details?id=com.draftkings.sportsbook
+    fanduel:
+    - https://sportsbook.fanduel.com/
+    - https://www.fanduel.com/sportsbook
+    - https://apps.apple.com/us/app/fanduel-sportsbook-casino/id1275517595
+    - https://play.google.com/store/apps/details?id=com.fanduel.sportsbook
+    kalshi:
+    - https://kalshi.com/
+    - https://kalshi.com/markets
+    - https://apps.apple.com/us/app/kalshi/id1641176216
+    - https://play.google.com/store/apps/details?id=com.kalshi.app
+    polymarket:
+    - https://polymarket.com/
+    - https://polymarket.com/markets
+    - https://apps.apple.com/us/app/polymarket/id6475594735
+    - https://play.google.com/store/apps/details?id=com.polymarket.app
