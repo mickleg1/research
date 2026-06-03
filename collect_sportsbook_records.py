@@ -1118,18 +1118,33 @@ def _extract_pa_metric_values_for_operator(
 
         values, duplicates, unassigned = _assign_pa_words_to_bins(words, bins, tolerance=tolerance)
         total_value = values.get("total")
-        populated_month_keys = [month_key for month_key in month_keys if values.get(month_key) is not None]
+
+        # If a trailing future month is rendered as 0 after a blank month, treat it as not-yet-reported.
+        month_values: Dict[str, Optional[float]] = {month_key: values.get(month_key) for month_key in month_keys}
+        saw_gap = False
+        for month_key in month_keys:
+            current = month_values.get(month_key)
+            if current is None:
+                saw_gap = True
+                continue
+            if saw_gap and abs(float(current)) < 1e-9:
+                month_values[month_key] = None
+
+        for month_key in month_keys:
+            values[month_key] = month_values.get(month_key)
+
+        populated_month_keys = [month_key for month_key in month_keys if month_values.get(month_key) is not None]
         latest_populated_idx = max((month_keys.index(month_key) for month_key in populated_month_keys), default=-1)
         required_month_keys = month_keys[: latest_populated_idx + 1] if latest_populated_idx >= 0 else []
-        missing_before_latest = [month_key for month_key in required_month_keys if values.get(month_key) is None]
+        missing_before_latest = [month_key for month_key in required_month_keys if month_values.get(month_key) is None]
         future_month_keys = month_keys[latest_populated_idx + 1 :] if latest_populated_idx >= 0 else month_keys
-        future_populated = [month_key for month_key in future_month_keys if values.get(month_key) is not None]
+        future_populated = [month_key for month_key in future_month_keys if month_values.get(month_key) is not None]
 
         required_token_count = len(required_month_keys) + (1 if total_value is not None else 0)
         count_ok = bool(required_month_keys) and not missing_before_latest and not future_populated and total_value is not None
 
         # Fiscal-year reports can have future months blank; reconcile over populated months only.
-        populated_values = [float(values[month_key]) for month_key in month_keys if values.get(month_key) is not None]
+        populated_values = [float(month_values[month_key]) for month_key in month_keys if month_values.get(month_key) is not None]
         sum_monthly: Optional[float] = None
         total_status = "missing_values"
         if total_value is not None and populated_values:
@@ -1212,8 +1227,8 @@ def parse_pa_matrix_pdf(path: str, source_url: str, logger) -> Tuple[List[Dict[s
         metrics = metric_bundle.get("metrics", {})
         handle_metric = metrics.get("handle", {})
 
-        metric_count_ok = all(bool(metrics.get(key, {}).get("count_ok")) for key in PA_METRIC_LABELS)
-        total_check_ok = all(metrics.get(key, {}).get("total_status") == "ok" for key in PA_METRIC_LABELS)
+        metric_count_ok = bool(handle_metric.get("count_ok"))
+        total_check_ok = handle_metric.get("total_status") == "ok"
 
         if not metric_count_ok or not total_check_ok:
             diagnostics["flagged_operators"].append(operator)
