@@ -73,6 +73,10 @@ EXTRA_COLUMNS = [
     "operator",
     "handle",
     "gross_revenue",
+    "promotional_credits",
+    "gross_revenue_taxable",
+    "pa_operator_total_check_status",
+    "pa_metric_count_check_status",
     "validation_status",
 ]
 
@@ -879,6 +883,358 @@ def parse_nj_monthly_pdf(path: str, source_url: str, logger) -> Tuple[List[Dict[
         final_records.append(add_provenance(record, source_url=source_url))
     return final_records, "ok"
 
+
+
+PA_METRIC_LABELS = {
+    "handle": "handle",
+    "revenue": "revenue",
+    "promotional_credits": "promotional credits",
+    "gross_revenue_taxable": "gross revenue (taxable)",
+}
+
+
+def _extract_pa_header_bins(first_page: Any) -> List[Dict[str, Any]]:
+    words = first_page.extract_words(
+        keep_blank_chars=False,
+        x_tolerance=1,
+        y_tolerance=1,
+        use_text_flow=True,
+        extra_attrs=["fontname", "size"],
+    )
+    top_words = [w for w in words if float(w.get("top", 0.0)) <= 95.0]
+    if not top_words:
+        return []
+
+    year_words = [
+        w
+        for w in top_words
+        if re.fullmatch(r"20\d{2}", str(w.get("text", "")).strip())
+    ]
+
+    month_bins: Dict[str, float] = {}
+    for word in top_words:
+        month_text = str(word.get("text", "")).strip().lower()
+        if month_text not in MONTH_NAME_TO_NUM:
+            continue
+        month_year: Optional[str] = None
+        month_top = float(word.get("top", 0.0))
+        month_x1 = float(word.get("x1", 0.0))
+        for year in year_words:
+            year_top = float(year.get("top", 0.0))
+            year_x0 = float(year.get("x0", 0.0))
+            if abs(year_top - month_top) > 2.5:
+                continue
+            if year_x0 < month_x1 - 2:
+                continue
+            if year_x0 - month_x1 > 28:
+                continue
+            month_year = str(year.get("text", "")).strip()
+            break
+        if month_year is None:
+            continue
+        month_key = f"{month_year}-{MONTH_NAME_TO_NUM[month_text]}"
+        month_bins.setdefault(month_key, float(word.get("x0", 0.0)))
+
+    total_candidates = [
+        float(word.get("x0", 0.0))
+        for word in top_words
+        if str(word.get("text", "")).strip().lower() == "total"
+    ]
+    total_x: Optional[float] = max(total_candidates) if total_candidates else None
+
+    bins = [{"key": month, "x0": x0, "is_total": False} for month, x0 in month_bins.items()]
+    bins.sort(key=lambda item: float(item["x0"]))
+    if total_x is not None:
+        bins.append({"key": "total", "x0": total_x, "is_total": True})
+    return bins
+
+
+def _parse_pa_numeric_token(token: str) -> Optional[float]:
+    cleaned = token.strip()
+    if not cleaned:
+        return None
+    if cleaned in {"-", "--", "—", "–"}:
+        return 0.0
+    if "%" in cleaned:
+        return None
+    if not re.search(r"\d", cleaned):
+        return None
+    normalized = cleaned.replace("$", "").replace(",", "").replace(" ", "")
+    if normalized.startswith("(") and normalized.endswith(")"):
+        normalized = f"-{normalized[1:-1]}"
+    normalized = normalized.strip()
+    if normalized in {"", "-"}:
+        return 0.0
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _assign_pa_words_to_bins(
+    words: List[Dict[str, Any]],
+    bins: List[Dict[str, Any]],
+    tolerance: float,
+) -> Tuple[Dict[str, float], List[str], List[str]]:
+    values: Dict[str, float] = {}
+    duplicates: List[str] = []
+    unassigned: List[str] = []
+    if not bins:
+        return values, duplicates, unassigned
+
+    distance_by_key: Dict[str, float] = {}
+    for word in sorted(words, key=lambda item: float(item.get("x0", 0.0))):
+        token = str(word.get("text", "")).strip()
+        value = _parse_pa_numeric_token(token)
+        if value is None:
+            continue
+        x0 = float(word.get("x0", 0.0))
+        nearest = min(bins, key=lambda item: abs(x0 - float(item["x0"])))
+        distance = abs(x0 - float(nearest["x0"]))
+        if distance > tolerance:
+            unassigned.append(token)
+            continue
+
+        key = str(nearest["key"])
+        if key in values:
+            if distance < distance_by_key.get(key, float("inf")):
+                values[key] = value
+                distance_by_key[key] = distance
+            duplicates.append(f"{key}:{token}")
+            continue
+        values[key] = value
+        distance_by_key[key] = distance
+    return values, duplicates, unassigned
+
+
+def _is_pa_operator_anchor_row(current_text: str, next_text: str) -> bool:
+    if next_text.strip().lower() != "total sports wagering":
+        return False
+    candidate = current_text.strip()
+    if not candidate:
+        return False
+    lower = candidate.lower()
+    if lower.startswith("fy"):
+        return False
+    if "monthly sports wagering report" in lower:
+        return False
+    if "sports wagering report summary" in lower:
+        return False
+    letters = [ch for ch in candidate if ch.isalpha()]
+    if not letters:
+        return False
+    uppercase_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
+    return uppercase_ratio >= 0.55
+
+
+def _extract_pa_operator_blocks(positioned_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    anchors: List[int] = []
+    for idx in range(len(positioned_rows) - 1):
+        current_text = str(positioned_rows[idx].get("text", ""))
+        next_text = str(positioned_rows[idx + 1].get("text", ""))
+        if _is_pa_operator_anchor_row(current_text, next_text):
+            anchors.append(idx)
+
+    blocks: List[Dict[str, Any]] = []
+    for pos, start_idx in enumerate(anchors):
+        end_idx = anchors[pos + 1] if pos + 1 < len(anchors) else len(positioned_rows)
+        operator = str(positioned_rows[start_idx].get("text", "")).strip()
+        block_rows = positioned_rows[start_idx:end_idx]
+        blocks.append({"operator": operator, "rows": block_rows})
+    return blocks
+
+
+def _extract_pa_metric_values_for_operator(
+    operator_rows: List[Dict[str, Any]],
+    bins: List[Dict[str, Any]],
+    logger,
+    operator: str,
+    tolerance: float = 22.0,
+) -> Dict[str, Any]:
+    total_idx = next(
+        (idx for idx, row in enumerate(operator_rows) if str(row.get("text", "")).strip().lower() == "total sports wagering"),
+        None,
+    )
+    if total_idx is None:
+        return {"status": "missing_total_section", "metrics": {}}
+
+    section_rows = operator_rows[total_idx + 1 :]
+    retail_idx = next(
+        (idx for idx, row in enumerate(section_rows) if "retail sports wagering" in str(row.get("text", "")).lower()),
+        len(section_rows),
+    )
+    section_rows = section_rows[:retail_idx]
+
+    anchor_idx: Dict[str, int] = {}
+    for idx, row in enumerate(section_rows):
+        text = str(row.get("text", "")).strip().lower()
+        if not text:
+            continue
+        if text.startswith(PA_METRIC_LABELS["handle"]):
+            anchor_idx.setdefault("handle", idx)
+        elif text.startswith(PA_METRIC_LABELS["revenue"]):
+            anchor_idx.setdefault("revenue", idx)
+        elif PA_METRIC_LABELS["promotional_credits"] in text:
+            anchor_idx.setdefault("promotional_credits", idx)
+        elif PA_METRIC_LABELS["gross_revenue_taxable"] in text:
+            anchor_idx.setdefault("gross_revenue_taxable", idx)
+
+    expected_count = len(bins)
+    month_keys = [str(item["key"]) for item in bins if not item.get("is_total")]
+    metrics: Dict[str, Any] = {}
+    for metric_key in ["handle", "revenue", "promotional_credits", "gross_revenue_taxable"]:
+        start = anchor_idx.get(metric_key)
+        if start is None:
+            metrics[metric_key] = {
+                "values": {},
+                "token_count": 0,
+                "expected": expected_count,
+                "count_ok": False,
+                "total_status": "missing_anchor",
+                "sum_monthly": None,
+                "total_value": None,
+                "duplicates": [],
+                "unassigned": [],
+            }
+            continue
+        end = min((idx for key, idx in anchor_idx.items() if idx > start), default=len(section_rows))
+        metric_rows = section_rows[start:end]
+        words: List[Dict[str, Any]] = []
+        for row in metric_rows:
+            words.extend(row.get("words", []))
+
+        values, duplicates, unassigned = _assign_pa_words_to_bins(words, bins, tolerance=tolerance)
+        total_value = values.get("total")
+        monthly_values = [values.get(month_key) for month_key in month_keys]
+        sum_monthly: Optional[float] = None
+        total_status = "missing_values"
+        if total_value is not None and all(value is not None for value in monthly_values):
+            sum_monthly = float(sum(float(value) for value in monthly_values))
+            if abs(sum_monthly - float(total_value)) <= 1.0:
+                total_status = "ok"
+            else:
+                total_status = "mismatch"
+
+        metrics[metric_key] = {
+            "values": values,
+            "token_count": len(values),
+            "expected": expected_count,
+            "count_ok": len(values) == expected_count,
+            "total_status": total_status,
+            "sum_monthly": sum_monthly,
+            "total_value": total_value,
+            "duplicates": duplicates,
+            "unassigned": unassigned,
+        }
+
+        if len(values) != expected_count:
+            logger.warning(
+                "pa_metric_column_count_mismatch operator=%s metric=%s found=%s expected=%s duplicates=%s unassigned=%s",
+                operator,
+                metric_key,
+                len(values),
+                expected_count,
+                duplicates,
+                unassigned,
+            )
+
+    return {
+        "status": "ok",
+        "metrics": metrics,
+    }
+
+
+def parse_pa_matrix_pdf(path: str, source_url: str, logger) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
+    with pdfplumber.open(path) as pdf:
+        if not pdf.pages:
+            return [], "empty_pdf", {}
+        header_bins = _extract_pa_header_bins(pdf.pages[0])
+        positioned_rows: List[Dict[str, Any]] = []
+        for page in pdf.pages:
+            positioned_rows.extend(_extract_positioned_rows_from_page(page, page.page_number - 1))
+
+    if not header_bins:
+        return [], "pa_header_not_found", {}
+
+    operator_blocks = _extract_pa_operator_blocks(positioned_rows)
+    if not operator_blocks:
+        return [], "pa_operator_blocks_not_found", {}
+
+    month_keys = [str(item["key"]) for item in header_bins if not item.get("is_total")]
+    diagnostics: Dict[str, Any] = {
+        "header_bins": header_bins,
+        "operator_reports": [],
+        "flagged_operators": [],
+    }
+    records: List[Dict[str, Any]] = []
+
+    for block in operator_blocks:
+        operator = str(block.get("operator", "")).strip()
+        metric_bundle = _extract_pa_metric_values_for_operator(
+            operator_rows=block.get("rows", []),
+            bins=header_bins,
+            logger=logger,
+            operator=operator,
+        )
+        metrics = metric_bundle.get("metrics", {})
+        handle_metric = metrics.get("handle", {})
+
+        metric_count_ok = all(bool(metrics.get(key, {}).get("count_ok")) for key in PA_METRIC_LABELS)
+        total_check_ok = all(metrics.get(key, {}).get("total_status") == "ok" for key in PA_METRIC_LABELS)
+
+        if not metric_count_ok or not total_check_ok:
+            diagnostics["flagged_operators"].append(operator)
+            move_to_needs_review(
+                path,
+                reason=f"pa_guard_failed_{operator.lower().replace(' ', '_')}",
+                logger=logger,
+            )
+
+        operator_report = {
+            "operator": operator,
+            "metric_count_ok": metric_count_ok,
+            "total_check_ok": total_check_ok,
+            "handle": handle_metric,
+            "metrics": metrics,
+        }
+        diagnostics["operator_reports"].append(operator_report)
+
+        for month_key in month_keys:
+            handle_value = metrics.get("handle", {}).get("values", {}).get(month_key)
+            revenue_value = metrics.get("revenue", {}).get("values", {}).get(month_key)
+            promo_value = metrics.get("promotional_credits", {}).get("values", {}).get(month_key)
+            taxable_value = metrics.get("gross_revenue_taxable", {}).get("values", {}).get(month_key)
+
+            validation_status = "parsed_pa_matrix"
+            if not metric_count_ok:
+                validation_status = "needs_review_pa_metric_count"
+            elif not total_check_ok:
+                validation_status = "needs_review_pa_total_reconciliation"
+
+            record = {
+                "platform": operator,
+                "platform_type": "sportsbook",
+                "metric_date": f"{month_key}-01",
+                "geography": "PA",
+                "volume": handle_value,
+                "volume_basis": "monthly_handle",
+                "revenue": taxable_value if taxable_value is not None else revenue_value,
+                "liquidity_or_oi": None,
+                "state": "PA",
+                "month": month_key,
+                "operator": operator,
+                "handle": handle_value,
+                "gross_revenue": taxable_value,
+                "promotional_credits": promo_value,
+                "gross_revenue_taxable": taxable_value,
+                "pa_operator_total_check_status": "ok" if total_check_ok else "failed",
+                "pa_metric_count_check_status": "ok" if metric_count_ok else "failed",
+                "validation_status": validation_status,
+            }
+            records.append(add_provenance(record, source_url=source_url))
+
+    return records, "ok", diagnostics
+
 def dataframe_views(df: pd.DataFrame) -> List[pd.DataFrame]:
     views: List[pd.DataFrame] = [df]
     limit = min(5, len(df) - 1)
@@ -1206,6 +1562,28 @@ def collect_state_reports(
                 layout_state["last_successful_source"] = result.url
             else:
                 logger.warning("nj_text_parse_failed file=%s reason=%s", raw_path, reason)
+
+        elif state_code == "PA" and ext == "pdf":
+            try:
+                pa_rows, reason, pa_diagnostics = parse_pa_matrix_pdf(raw_path, source_url=result.url, logger=logger)
+            except Exception as exc:
+                logger.warning("parse_failed state=%s file=%s err=%s", state_code, raw_path, exc)
+                move_to_needs_review(raw_path, reason=f"parse_failed:{exc}", logger=logger)
+                continue
+
+            if pa_rows:
+                parsed_any = True
+                records.extend(pa_rows)
+                layout_state["last_successful_fingerprint"] = "pa_xbin_matrix_fy_month_columns"
+                layout_state["last_successful_source"] = result.url
+                logger.info(
+                    "pa_parse_summary file=%s operators=%s flagged=%s",
+                    raw_path,
+                    len(pa_diagnostics.get("operator_reports", [])),
+                    len(pa_diagnostics.get("flagged_operators", [])),
+                )
+            else:
+                logger.warning("pa_matrix_parse_failed file=%s reason=%s", raw_path, reason)
 
         else:
             try:
