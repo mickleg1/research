@@ -1008,9 +1008,6 @@ def _assign_pa_words_to_bins(
 
         key = str(nearest["key"])
         if key in values:
-            if distance < distance_by_key.get(key, float("inf")):
-                values[key] = value
-                distance_by_key[key] = distance
             duplicates.append(f"{key}:{token}")
             continue
         values[key] = value
